@@ -61,6 +61,7 @@ button.chip{font:inherit;cursor:pointer;min-height:36px}
 .who time{font-weight:400;color:var(--muted)}
 .said{color:hsl(var(--h),50%,var(--textL));line-height:1.3;overflow-wrap:anywhere}
 .said .live{opacity:.62}
+.said .line + .line{margin-top:.12em}
 .turn.me{border-left-color:var(--muted);background:transparent;outline:1px dashed var(--line);outline-offset:-1px}
 .turn.me .who{color:var(--muted)}.turn.me .said{color:var(--fg)}
 .empty{color:var(--muted);font-size:20px;text-align:center;margin:12vh auto 0;max-width:28em;padding:0 8px}
@@ -122,6 +123,7 @@ h1{font-size:1.5em;margin:0 0 .3em}
       <button id="bMenu" class="btn" aria-label="More options" aria-expanded="false">⋯</button>
     </div>
     <div id="menu" class="menu" hidden>
+      <button id="bDedupe"></button>
       <button id="bRoom">Room mic (this device listens)</button>
       <button id="bSave">Save transcript</button>
       <button id="bClear">Clear transcript</button>
@@ -246,10 +248,14 @@ class Listener {
     r.lang = this.lang; r.interimResults = true; r.continuous = false; r.maxAlternatives = 1;
     r.onresult = e => {
       if (done) return;
-      const parts = [];
-      for (let i = 0; i < e.results.length; i++) parts.push(e.results[i][0].transcript.trim());
+      const parts = []; let cs = 0, cn = 0;
+      for (let i = 0; i < e.results.length; i++) {
+        const a = e.results[i][0]; parts.push(a.transcript.trim());
+        if (e.results[i].isFinal && a.confidence > 0) { cs += a.confidence; cn++; }
+      }
       text = parts.join(' ').trim(); this.errs = 0;
-      if (e.results[e.results.length - 1].isFinal) { done = true; this.o.onFinal(uid, text); }
+      // confidence: how sure the speech engine is (0–1); a phone far from the speaker is usually less sure
+      if (e.results[e.results.length - 1].isFinal) { done = true; this.o.onFinal(uid, text, cn ? cs / cn : 0); }
       else this.o.onPartial(uid, text);
     };
     r.onerror = e => {
@@ -391,40 +397,89 @@ function startHost() {
     const said = document.createElement('div'); said.className = 'said';
     el.append(who, said); feed.append(el);
     $('#empty').hidden = true;
-    return (H.lastTurn = { k, el, said, at: ts });
+    return (H.lastTurn = { k, el, said, at: ts, line: null, lineAt: 0 });
+  }
+  /* inside one person's block: a pause of 2.5 s or more starts a new line */
+  const LINE_GAP = 2500;
+  function lineFor(turn, ts, forceNew) {
+    const fresh = forceNew === undefined ? (!turn.line || !turn.line.isConnected || ts - turn.lineAt > LINE_GAP) : (forceNew || !turn.line || !turn.line.isConnected);
+    if (fresh) { turn.line = document.createElement('div'); turn.line.className = 'line'; turn.said.append(turn.line); }
+    turn.lineAt = ts; turn.fresh = fresh;
+    return turn.line;
   }
   let saveTimer = 0;
   function flushLog() { clearTimeout(saveTimer); if (H.log.length > 3000) H.log = H.log.slice(-3000); store.set('lc_log_' + roomId, H.log); }
   function saveLog() { clearTimeout(saveTimer); saveTimer = setTimeout(flushLog, 400); }
-  function addFinal(k, name, hue, text, ts = Date.now(), save = true) {
+  function addFinal(k, name, hue, text, ts = Date.now(), save = true, nl) {
     const near = nearBottom();
     const t = turnFor(k, name, hue, ts);
     const s = document.createElement('span'); s.className = 'fin'; s.textContent = text + ' ';
-    t.said.append(s);
-    H.log.push({ k, n: name, h: hue, t: text, ts });
+    lineFor(t, ts, save ? undefined : nl).append(s);
+    H.log.push({ k, n: name, h: hue, t: text, ts, nl: t.fresh });
     if (save) saveLog();
     after(near);
   }
-  function liveText(k, name, hue, u, text, final) {
+  /* Same room, several phones: everyone's phone hears everyone. When two phones send nearly the
+     same sentence within 10 seconds, keep one copy, credited to the phone that heard it best
+     (higher speech-engine confidence; if that's unclear, the one that caught more words). */
+  H.dedupe = store.get('lc_dedupe', true);
+  H.recent = [];
+  const wordsOf = t => t.toLowerCase().replace(/[^\p{L}\p{N}' ]+/gu, ' ').split(/\s+/).filter(Boolean);
+  function similar(a, b) {
+    if (Math.min(a.length, b.length) < 3) return false; // "yes" from two people is two answers
+    const count = new Map(); for (const w of a) count.set(w, (count.get(w) || 0) + 1);
+    let common = 0; for (const w of b) { const n = count.get(w); if (n) { common++; count.set(w, n - 1); } }
+    return common / Math.min(a.length, b.length) >= 0.6;
+  }
+  function findDup(c) {
+    const now = Date.now();
+    H.recent = H.recent.filter(r => now - r.at < 10000 && r.span.isConnected);
+    for (let i = H.recent.length - 1; i >= 0; i--) { const r = H.recent[i]; if (r.k !== c.k && similar(r.words, c.words)) return r; }
+    return null;
+  }
+  function beats(c, r) {
+    if (c.conf > 0 && r.conf > 0 && Math.abs(c.conf - r.conf) > 0.05) return c.conf > r.conf;
+    if (c.words.length !== r.words.length) return c.words.length > r.words.length;
+    return false; // a tie goes to whoever was first
+  }
+  function removeSpan(turn, span) {
+    const line = span.parentNode;
+    span.remove();
+    if (line && line.classList.contains('line') && !line.childNodes.length) line.remove();
+    if (!turn.said.childNodes.length) { turn.el.remove(); if (H.lastTurn === turn) H.lastTurn = null; }
+  }
+  function dropCommitted(r) {
+    removeSpan(r.turn, r.span);
+    const i = H.log.indexOf(r.entry); if (i >= 0) H.log.splice(i, 1);
+    H.recent = H.recent.filter(x => x !== r);
+    saveLog();
+  }
+  function liveText(k, name, hue, u, text, final, conf = 0) {
     const key = k + '|' + u;
     let L = H.live.get(key);
     const near = nearBottom();
     if (!L) {
       if (!text) return;
-      const turn = turnFor(k, name, hue, Date.now());
+      const now = Date.now();
+      const turn = turnFor(k, name, hue, now);
       const span = document.createElement('span'); span.className = 'live';
-      turn.said.append(span);
-      L = { k, name, hue, u, span, turn }; H.live.set(key, L);
+      lineFor(turn, now).append(span);
+      L = { k, name, hue, u, span, turn, nl: turn.fresh }; H.live.set(key, L);
     }
     L.at = Date.now();
+    if (L.span.parentNode === L.turn.line) L.turn.lineAt = L.at; // still talking: the pause is measured from here
     if (final) {
       H.live.delete(key);
-      if (!text) {
-        L.span.remove();
-        if (!L.turn.said.childNodes.length) { L.turn.el.remove(); if (H.lastTurn === L.turn) H.lastTurn = null; }
+      const cand = { k, words: wordsOf(text), conf, at: Date.now() };
+      const dup = text && H.dedupe ? findDup(cand) : null;
+      if (!text || (dup && !beats(cand, dup))) {
+        removeSpan(L.turn, L.span); // empty, or someone else's phone already has this sentence, heard better
       } else {
+        if (dup) dropCommitted(dup); // this phone heard it better: take it away from the other one
         L.span.className = 'fin'; L.span.textContent = text + ' ';
-        H.log.push({ k, n: name, h: hue, t: text, ts: Date.now() }); saveLog();
+        const entry = { k, n: name, h: hue, t: text, ts: Date.now(), nl: !!L.nl };
+        H.log.push(entry); saveLog();
+        H.recent.push(Object.assign(cand, { span: L.span, turn: L.turn, entry }));
       }
     } else if (text) L.span.textContent = text + ' ';
     renderChips();
@@ -435,7 +490,7 @@ function startHost() {
   }
   function loadLog() {
     const saved = store.get('lc_log_' + roomId, []);
-    if (Array.isArray(saved)) for (const e of saved) if (e && e.t) addFinal(e.k, e.n, e.h, e.t, e.ts, false);
+    if (Array.isArray(saved)) for (const e of saved) if (e && e.t) addFinal(e.k, e.n, e.h, e.t, e.ts, false, e.nl);
     toBottom();
   }
   loadLog();
@@ -589,6 +644,10 @@ function startHost() {
   document.addEventListener('click', e => { if (!menu.hidden && !menu.contains(e.target)) { menu.hidden = true; bMenu.setAttribute('aria-expanded', 'false'); } });
   menu.addEventListener('click', e => { if (e.target.tagName === 'BUTTON') menu.hidden = true; });
   $('#bTheme').onclick = toggleTheme;
+  const bDedupe = $('#bDedupe');
+  const renderDedupe = () => { bDedupe.textContent = H.dedupe ? 'Same room: show each sentence once ✓' : 'Same room: show each sentence once (off)'; };
+  bDedupe.onclick = () => { H.dedupe = !H.dedupe; store.set('lc_dedupe', H.dedupe); renderDedupe(); };
+  renderDedupe();
   $('#bSave').onclick = () => {
     const lines = H.log.map(e => '[' + hhmm(e.ts) + '] ' + e.n + ': ' + e.t);
     const d = new Date(), p = x => String(x).padStart(2, '0');
@@ -617,7 +676,7 @@ function startHost() {
       H.roomMic = new Listener({
         lang: navigator.language || 'en-US',
         onPartial: (u, t) => { const sp = roomSpeaker(); liveText('room', sp.name, sp.hue, u, t, false); },
-        onFinal: (u, t) => { const sp = roomSpeaker(); liveText('room', sp.name, sp.hue, u, t, true); },
+        onFinal: (u, t, cf) => { const sp = roomSpeaker(); liveText('room', sp.name, sp.hue, u, t, true, cf); },
         onState: s => {
           const sp = roomSpeaker();
           if (s === 'on') sp.conns.add('local'); else { sp.conns.delete('local'); finalizeLive('room'); }
@@ -679,7 +738,7 @@ function startHost() {
       if (H.done.has(key)) return;      // a resend (or the copy from the second relay) we already have
       H.done.add(key); H.seq.delete(key); if (H.done.size > 5000) H.done.clear();
       const t = clip(m.text, 4000);
-      if (m.t === 'final') liveText(cid, sp.name, sp.hue, u, t, true);
+      if (m.t === 'final') liveText(cid, sp.name, sp.hue, u, t, true, Math.max(0, Math.min(1, +m.cf || 0)));
       else if (t) addFinal(cid, sp.name, sp.hue, t);
     } else if (m.t === 'bye') { sp.conns.delete('net'); renderChips(); }
   }
@@ -730,7 +789,7 @@ function startGuest() {
   const listener = SR ? new Listener({
     lang: G.lang,
     onPartial: (u, t) => { sendPartial(u, t); $('#gLive').textContent = t; if (hint.classList.contains('bad')) renderMic(); },
-    onFinal: (u, t) => { sendFinal('final', u, t); pushHist(t, u); $('#gLive').textContent = ''; },
+    onFinal: (u, t, cf) => { sendFinal('final', u, t, cf); pushHist(t, u); $('#gLive').textContent = ''; },
     onState: () => renderMic(),
     onError: e => {
       if (e === 'blocked') setHint('The microphone is blocked. Allow it for this site in your browser settings, then tap the mic.', true);
@@ -791,10 +850,10 @@ function startGuest() {
     G.partialTimer = 0; const m = G.pending; if (!m) return;
     G.pending = null; G.partialAt = Date.now(); raw(m);
   }
-  function sendFinal(t, u, text) {
+  function sendFinal(t, u, text, cf) {
     if (!text) return;
     if (G.pending && G.pending.u === u) G.pending = null;
-    G.outbox.set(u, { m: { t, u, text }, at: 0 });
+    G.outbox.set(u, { m: { t, u, text, cf: +(cf || 0).toFixed(3) }, at: 0 });
     while (G.outbox.size > 100) G.outbox.delete(G.outbox.keys().next().value);
     flushOutbox();
   }
