@@ -1,0 +1,760 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Live Captions</title>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
+<style>
+:root{--bg:#f5f6f8;--panel:#fff;--fg:#14171c;--muted:#5b6470;--line:#d9dee4;--accent:#1f6feb;--accent-fg:#fff;--ok:#1a8f3c;--warn:#b25b00;--bad:#c62828;--nameL:33%;--textL:20%;--tint:.09;--fs:30px;color-scheme:light}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0e1115;--panel:#171b21;--fg:#eef1f5;--muted:#9aa4b1;--line:#2a3039;--accent:#4c8dff;--accent-fg:#fff;--ok:#3ccf6a;--warn:#ffb14a;--bad:#ff6b6b;--nameL:72%;--textL:90%;--tint:.15;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#0e1115;--panel:#171b21;--fg:#eef1f5;--muted:#9aa4b1;--line:#2a3039;--accent:#4c8dff;--accent-fg:#fff;--ok:#3ccf6a;--warn:#ffb14a;--bad:#ff6b6b;--nameL:72%;--textL:90%;--tint:.15;color-scheme:dark}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-text-size-adjust:100%}
+button,input,select{font:inherit;color:inherit}
+[hidden]{display:none!important}
+.btn{border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:.45em .8em;min-height:44px;min-width:44px;cursor:pointer;white-space:nowrap}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg);font-weight:600}
+.btn.big{width:100%;padding:.8em;font-size:1.1em}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--muted);display:inline-block;flex:none}
+.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.bad{background:var(--bad)}
+.chip{--h:205;display:inline-flex;align-items:center;gap:6px;padding:4px 11px;border-radius:999px;background:hsla(var(--h),70%,50%,var(--tint));border:1px solid hsla(var(--h),70%,50%,.55);color:hsl(var(--h),75%,var(--nameL));font-weight:600;white-space:nowrap}
+.chip .dot{background:hsl(var(--h),75%,52%)}
+.chip.talking .dot{animation:pulse .9s infinite}
+@keyframes pulse{50%{transform:scale(1.7);opacity:.55}}
+
+/* ---------- host ---------- */
+.host{display:flex;flex-direction:column;height:100vh;height:100dvh}
+.bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px max(12px,env(safe-area-inset-right)) 8px max(12px,env(safe-area-inset-left));border-bottom:1px solid var(--line);background:var(--panel);position:relative;z-index:10}
+.brand{display:flex;align-items:center;gap:8px;white-space:nowrap;min-width:0}
+.roombtn{display:inline-flex;align-items:center;gap:8px;font-weight:700;max-width:46vw}
+.roombtn .rn{overflow:hidden;text-overflow:ellipsis}
+#status{color:var(--muted);font-size:.92em}
+.roomlist{display:flex;flex-direction:column;gap:8px;margin:14px 0;text-align:left}
+.roomrow{display:flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:12px;padding:6px}
+.roomrow.current{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
+.roomrow .roomname{flex:1;min-width:0;text-align:left;background:none;border:0;padding:.5em;font-weight:600;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-height:44px}
+.roomrow input,.addroom input{flex:1;min-width:0;border:1px solid var(--line);border-radius:10px;padding:.5em .7em;background:var(--bg);font-size:17px}
+.badge{font-size:12px;font-weight:700;color:var(--accent);white-space:nowrap;padding:0 4px}
+.addroom{display:flex;gap:8px}
+.mt{margin-top:12px}
+.chips{display:flex;gap:6px;overflow-x:auto;flex:1;min-width:0;scrollbar-width:none}
+.tools{display:flex;gap:6px;margin-left:auto}
+@media (max-width:640px){.chips{order:3;flex-basis:100%}}
+.menu{position:absolute;right:12px;top:100%;margin-top:4px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:6px;display:flex;flex-direction:column;min-width:240px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+.menu button{background:none;border:0;text-align:left;padding:.65em .8em;border-radius:8px;cursor:pointer;min-height:44px}
+.menu button:hover{background:var(--line)}
+.feedwrap{position:relative;flex:1;min-height:0}
+.feed{position:absolute;inset:0;overflow-y:auto;padding:14px max(16px,env(safe-area-inset-right)) 28px max(16px,env(safe-area-inset-left));font-size:var(--fs);-webkit-overflow-scrolling:touch}
+.turn{--h:0;margin:0 0 .4em;padding:.2em .6em .3em;border-left:max(5px,.2em) solid hsl(var(--h),75%,55%);background:hsla(var(--h),70%,50%,var(--tint));border-radius:0 .3em .3em 0}
+.who{font-size:max(13px,.46em);font-weight:700;color:hsl(var(--h),80%,var(--nameL));display:flex;gap:.7em;align-items:baseline}
+.who time{font-weight:400;color:var(--muted)}
+.said{color:hsl(var(--h),50%,var(--textL));line-height:1.3;overflow-wrap:anywhere}
+.said .live{opacity:.62}
+.turn.me{border-left-color:var(--muted);background:transparent;outline:1px dashed var(--line);outline-offset:-1px}
+.turn.me .who{color:var(--muted)}.turn.me .said{color:var(--fg)}
+.empty{color:var(--muted);font-size:20px;text-align:center;margin:12vh auto 0;max-width:28em;padding:0 8px}
+.jump{position:absolute;right:16px;bottom:12px;border-radius:999px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
+.reply{border-top:1px solid var(--line);background:var(--panel);padding:8px max(12px,env(safe-area-inset-right)) max(8px,env(safe-area-inset-bottom)) max(12px,env(safe-area-inset-left))}
+.quick{display:flex;gap:6px;overflow-x:auto;padding-bottom:8px;scrollbar-width:none}
+.reply form{display:flex;gap:8px}
+.reply input{flex:1;min-width:0;border:1px solid var(--line);border-radius:10px;padding:.5em .8em;background:var(--bg);font-size:18px}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px;z-index:50}
+.sheet{background:var(--panel);border-radius:18px;padding:20px;width:min(440px,100%);max-height:100%;overflow:auto;text-align:center}
+.sheet h2{margin:0 0 4px}
+.qr{background:#fff;padding:12px;border-radius:12px;width:min(300px,70vw,42vh);margin:10px auto}
+.qr svg{display:block;width:100%;height:auto}
+.url{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;word-break:break-all;color:var(--muted);margin:4px 0}
+.note{color:var(--warn);font-weight:600}
+label{display:block;text-align:left;font-weight:600;margin:14px 0}
+label input,label select{display:block;width:100%;margin-top:6px;border:1px solid var(--line);border-radius:10px;padding:.6em .8em;background:var(--bg);font-size:18px;font-weight:400}
+
+/* ---------- guest ---------- */
+.gwrap{--h:205;max-width:520px;margin:0 auto;padding:16px max(16px,env(safe-area-inset-right)) max(16px,env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left));min-height:100vh;min-height:100dvh;display:flex;flex-direction:column;gap:14px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px}
+h1{font-size:1.5em;margin:0 0 .3em}
+.lead{color:var(--muted);margin:0}
+.gmain{display:flex;flex-direction:column;gap:14px;flex:1}
+.gtop{display:flex;align-items:center;gap:8px;font-size:15px}
+.gtop .chip{margin-left:auto;cursor:pointer;font-size:16px;border-style:solid}
+.mic{width:min(170px,46vw);aspect-ratio:1;border-radius:50%;border:0;margin:6px auto 0;display:grid;place-items:center;background:var(--line);color:var(--fg);cursor:pointer;position:relative}
+.mic svg{width:40%;height:40%}
+.mic.on{background:hsl(var(--h),70%,46%);color:#fff}
+.mic.on::after{content:"";position:absolute;inset:-10px;border-radius:50%;border:4px solid hsl(var(--h),70%,55%);animation:ring 1.6s infinite}
+@keyframes ring{from{transform:scale(.92);opacity:1}to{transform:scale(1.12);opacity:0}}
+.hint{text-align:center;color:var(--muted);margin:0;min-height:1.4em}
+.hint.bad{color:var(--bad);font-weight:600}
+.heard{min-height:5em}
+.heard .old{color:var(--muted);font-size:17px;margin:2px 0}
+.livebig{color:hsl(var(--h),50%,var(--textL));font-size:24px;min-height:1.4em;font-style:italic}
+.replycard{border-radius:16px;padding:12px 16px;background:var(--accent);color:var(--accent-fg);font-size:24px;line-height:1.3}
+.replycard .from{font-size:13px;opacity:.85;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+.typeform{display:flex;gap:8px;margin-top:auto}
+.typeform input{flex:1;min-width:0;border:1px solid var(--line);border-radius:10px;padding:.55em .8em;background:var(--panel);font-size:18px}
+.warn{color:var(--warn);font-weight:600}
+.fatal{max-width:480px;margin:20vh auto;font-size:18px}
+@media (prefers-reduced-motion:reduce){*{animation:none!important}}
+</style>
+</head>
+<body>
+
+<template id="tpl-host">
+<div class="host">
+  <header class="bar">
+    <div class="brand"><button id="bRooms" class="btn roombtn" title="Rooms"><span id="dot" class="dot warn"></span><span id="roomName" class="rn"></span><span aria-hidden="true">▾</span></button><span id="status">Connecting…</span></div>
+    <div id="chips" class="chips" aria-label="People connected"></div>
+    <div class="tools">
+      <button id="bInvite" class="btn primary">Invite</button>
+      <button id="bSmaller" class="btn" aria-label="Smaller text">A−</button>
+      <button id="bBigger" class="btn" aria-label="Bigger text">A+</button>
+      <button id="bMenu" class="btn" aria-label="More options" aria-expanded="false">⋯</button>
+    </div>
+    <div id="menu" class="menu" hidden>
+      <button id="bRoom">Room mic (this device listens)</button>
+      <button id="bSave">Save transcript</button>
+      <button id="bClear">Clear transcript</button>
+      <button id="bTheme">Light / dark</button>
+    </div>
+  </header>
+  <div class="feedwrap">
+    <main id="feed" class="feed" aria-live="polite">
+      <div id="empty" class="empty">Tap <b>Invite</b> and have people scan the code with their phone camera.<br>Everything they say shows up here, with their name and color.</div>
+    </main>
+    <button id="jump" class="btn primary jump" hidden>↓ Latest</button>
+  </div>
+  <footer class="reply">
+    <div id="quick" class="quick"></div>
+    <form id="replyForm"><input id="replyIn" placeholder="Type to show on everyone's phone…" autocomplete="off" enterkeyhint="send" maxlength="1000"><button class="btn primary">Send</button></form>
+  </footer>
+  <div id="invite" class="overlay">
+    <div class="sheet" role="dialog" aria-label="Invite">
+      <h2>Scan to join</h2>
+      <div class="lead">Room: <b id="inviteRoom"></b></div>
+      <div class="lead">Open the phone camera and point it at the code.</div>
+      <div id="qr" class="qr"></div>
+      <p id="joinUrl" class="url"></p>
+      <p id="inviteNote" class="note" hidden></p>
+      <p id="inviteCount" class="lead"></p>
+      <label>Your name (shown on their phones)<input id="hostName" maxlength="30" placeholder="optional"></label>
+      <button id="bDone" class="btn primary big">Done</button>
+    </div>
+  </div>
+  <div id="rooms" class="overlay" hidden>
+    <div class="sheet" role="dialog" aria-label="Rooms">
+      <h2>Rooms</h2>
+      <div class="lead">Each room has its own QR code and transcript. People who joined a room before reconnect by themselves whenever you open it.</div>
+      <div id="roomList" class="roomlist"></div>
+      <form id="addRoom" class="addroom"><input id="newRoomName" maxlength="40" placeholder="New room, e.g. Math class" autocomplete="off"><button class="btn primary">Add</button></form>
+      <button id="bRoomsDone" class="btn big mt" type="button">Done</button>
+    </div>
+  </div>
+</div>
+</template>
+
+<template id="tpl-guest">
+<div class="gwrap">
+  <section id="gJoin" class="card">
+    <h1>Live Captions</h1>
+    <p class="lead">What you say will appear as text on the screen of the person who showed you this code.</p>
+    <label>Your name<input id="gName" maxlength="30" autocomplete="given-name" placeholder="e.g. Maria" enterkeyhint="go"></label>
+    <label>Language you'll speak<select id="gLang"></select></label>
+    <p id="gWarn" class="warn" hidden></p>
+    <button id="gJoinBtn" class="btn primary big">Join and start talking</button>
+  </section>
+  <section id="gMain" class="gmain" hidden>
+    <div class="gtop"><span id="gDot" class="dot warn"></span><span id="gStatus">Connecting…</span><button id="gMe" class="chip" title="Change name or language"></button></div>
+    <div id="gReply" class="replycard" hidden><div id="gReplyFrom" class="from"></div><div id="gReplyText"></div></div>
+    <button id="gMic" class="mic" aria-label="Microphone">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><path d="M12 17v4"/><path d="M8 21h8"/></svg>
+    </button>
+    <p id="gHint" class="hint"></p>
+    <div class="heard"><div id="gHist"></div><div id="gLive" class="livebig"></div></div>
+    <form id="gTypeForm" class="typeform"><input id="gType" placeholder="Or type a message…" autocomplete="off" enterkeyhint="send" maxlength="1000"><button class="btn">Send</button></form>
+  </section>
+</div>
+</template>
+
+<script>
+'use strict';
+const $ = (s, r = document) => r.querySelector(s);
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+};
+const params = new URLSearchParams(location.search);
+const joinId = (params.get('join') || '').trim();
+const PREFIX = 'lc-';
+const HUES = [205, 30, 130, 330, 55, 270, 175, 0, 95, 240];
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const LANGS = [['en-US','English (US)'],['en-GB','English (UK)'],['es-US','Español (EE. UU.)'],['es-MX','Español (México)'],['es-ES','Español (España)'],['fr-FR','Français'],['de-DE','Deutsch'],['it-IT','Italiano'],['pt-BR','Português (Brasil)'],['zh-CN','中文 (普通话)'],['zh-TW','中文 (台灣)'],['ja-JP','日本語'],['ko-KR','한국어'],['ru-RU','Русский'],['uk-UA','Українська'],['ar-SA','العربية'],['hi-IN','हिन्दी'],['vi-VN','Tiếng Việt']];
+
+function rid(n) { const a = 'abcdefghjkmnpqrstuvwxyz23456789'; let s = ''; for (const x of crypto.getRandomValues(new Uint8Array(n))) s += a[x % a.length]; return s; }
+function clip(s, n) { return String(s == null ? '' : s).replace(/\s+/g, ' ').trim().slice(0, n); }
+function hhmm(ts) { return new Date(ts).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); }
+function mount(id) { document.body.append(document.getElementById(id).content.cloneNode(true)); }
+function fatal(msg) { document.body.textContent = ''; const d = document.createElement('div'); d.className = 'card fatal'; d.textContent = msg; document.body.append(d); }
+
+/* theme */
+function applyTheme() { const t = store.get('lc_theme', ''); if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme; }
+function toggleTheme() {
+  const cur = document.documentElement.dataset.theme;
+  const dark = cur ? cur === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+  store.set('lc_theme', dark ? 'light' : 'dark'); applyTheme();
+}
+applyTheme();
+
+/* keep screen awake */
+let wakeLock = null, wantWake = false;
+async function keepAwake(on) {
+  wantWake = on;
+  try {
+    if (on && 'wakeLock' in navigator && !wakeLock) { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release', () => { wakeLock = null; }); }
+    else if (!on && wakeLock) { await wakeLock.release(); wakeLock = null; }
+  } catch (e) {}
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && wantWake) keepAwake(true); });
+
+/* Speech-to-text: one utterance per recognition session, restarted automatically.
+   (continuous=false is the mode that behaves the same on Android Chrome, desktop Chrome and iOS Safari.) */
+class Listener {
+  constructor(o) {
+    this.o = o; this.lang = o.lang; this.want = false; this.rec = null; this.errs = 0; this.n = 0; this.prefix = rid(4);
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && this.want && !this.rec) this._spawn(); });
+  }
+  start() { if (!SR) return; this.want = true; this.errs = 0; if (!this.rec) this._spawn(); this.o.onState('on'); }
+  stop() { this.want = false; if (this.rec) try { this.rec.stop(); } catch (e) {} this.o.onState('off'); }
+  setLang(l) { this.lang = l; if (this.rec) try { this.rec.abort(); } catch (e) {} }
+  _spawn() {
+    let r;
+    try { r = new SR(); } catch (e) { this.want = false; this.o.onState('off'); this.o.onError('unsupported'); return; }
+    this.rec = r;
+    const uid = this.prefix + (++this.n);
+    let text = '', done = false;
+    r.lang = this.lang; r.interimResults = true; r.continuous = false; r.maxAlternatives = 1;
+    r.onresult = e => {
+      if (done) return;
+      const parts = [];
+      for (let i = 0; i < e.results.length; i++) parts.push(e.results[i][0].transcript.trim());
+      text = parts.join(' ').trim(); this.errs = 0;
+      if (e.results[e.results.length - 1].isFinal) { done = true; this.o.onFinal(uid, text); }
+      else this.o.onPartial(uid, text);
+    };
+    r.onerror = e => {
+      const k = e.error;
+      if (k === 'not-allowed' || k === 'service-not-allowed') { this.want = false; this.o.onState('off'); this.o.onError('blocked'); }
+      else if (k !== 'no-speech' && k !== 'aborted') { this.errs++; this.o.onError(k); }
+    };
+    r.onend = () => {
+      if (!done && text) this.o.onFinal(uid, text);
+      if (this.rec === r) this.rec = null;
+      if (this.want && document.visibilityState === 'visible') {
+        const d = this.errs ? Math.min(5000, 600 * this.errs) : 50;
+        setTimeout(() => { if (this.want && !this.rec) this._spawn(); }, d);
+      }
+    };
+    try { r.start(); }
+    catch (e) { this.rec = null; this.errs++; setTimeout(() => { if (this.want && !this.rec) this._spawn(); }, 1000); }
+  }
+}
+
+/* ======================= HOST (the deaf user's screen) ======================= */
+function startHost() {
+  mount('tpl-host');
+  const feed = $('#feed'), chips = $('#chips'), jump = $('#jump');
+  /* rooms: each has its own code (peer id) and its own transcript */
+  const validId = id => typeof id === 'string' && /^lc-[a-z0-9]{6,24}$/.test(id);
+  let rooms = store.get('lc_rooms', null);
+  if (!Array.isArray(rooms) || !rooms.length) { // first run, or upgrade from the one-room version
+    const old = store.get('lc_room', '');
+    const id = validId(old) ? old : PREFIX + rid(10);
+    rooms = [{ id, name: 'Room 1' }];
+    store.set('lc_log_' + id, store.get('lc_log', []));
+    store.set('lc_rooms', rooms);
+    try { localStorage.removeItem('lc_log'); } catch (e) {}
+  }
+  rooms = rooms.filter(r => r && validId(r.id)).map(r => ({ id: r.id, name: clip(r.name, 40) || 'Room' }));
+  if (!rooms.length) rooms = [{ id: PREFIX + rid(10), name: 'Room 1' }];
+  let roomId = store.get('lc_room', '');
+  if (!rooms.some(r => r.id === roomId)) roomId = rooms[0].id;
+  store.set('lc_room', roomId);
+  const saveRooms = () => store.set('lc_rooms', rooms);
+  const roomName = () => (rooms.find(r => r.id === roomId) || {}).name || 'Room';
+  const H = { peer: null, idFails: 0, conns: new Map(), speakers: new Map(), live: new Map(), log: [], lastTurn: null, hostName: store.get('lc_hostname', ''), roomMic: null };
+
+  /* text size */
+  let fs = store.get('lc_fs', 30);
+  const setFs = v => { fs = Math.max(16, Math.min(80, v)); document.documentElement.style.setProperty('--fs', fs + 'px'); store.set('lc_fs', fs); };
+  setFs(fs);
+  $('#bSmaller').onclick = () => { const n = nearBottom(); setFs(fs - 4); if (n) toBottom(); };
+  $('#bBigger').onclick = () => { const n = nearBottom(); setFs(fs + 4); if (n) toBottom(); };
+
+  /* scrolling */
+  function nearBottom() { return feed.scrollHeight - feed.scrollTop - feed.clientHeight < 140; }
+  function toBottom() { feed.scrollTop = feed.scrollHeight; jump.hidden = true; }
+  function after(wasNear) { if (wasNear) toBottom(); else jump.hidden = false; }
+  feed.addEventListener('scroll', () => { if (nearBottom()) jump.hidden = true; });
+  jump.onclick = toBottom;
+
+  /* colors */
+  function hueFor(cid) {
+    const map = store.get('lc_hues', {});
+    if (typeof map[cid] === 'number') return map[cid];
+    const online = new Set([...H.speakers.values()].filter(s => s.conns.size).map(s => s.hue));
+    const used = new Set(Object.values(map));
+    let h = HUES.find(x => !online.has(x) && !used.has(x));
+    if (h == null) h = HUES.find(x => !online.has(x));
+    if (h == null) h = HUES[Object.keys(map).length % HUES.length];
+    map[cid] = h; store.set('lc_hues', map); return h;
+  }
+
+  /* transcript */
+  function turnFor(k, name, hue, ts) {
+    const L = H.lastTurn;
+    if (L && L.k === k && ts - L.at < 90000 && L.el.isConnected) { L.at = ts; return L; }
+    const el = document.createElement('div'); el.className = 'turn' + (k === 'me' ? ' me' : '');
+    if (hue != null) el.style.setProperty('--h', hue);
+    const who = document.createElement('div'); who.className = 'who';
+    const nm = document.createElement('span'); nm.textContent = name;
+    const tm = document.createElement('time'); tm.textContent = hhmm(ts);
+    who.append(nm, tm);
+    const said = document.createElement('div'); said.className = 'said';
+    el.append(who, said); feed.append(el);
+    $('#empty').hidden = true;
+    return (H.lastTurn = { k, el, said, at: ts });
+  }
+  let saveTimer = 0;
+  function flushLog() { clearTimeout(saveTimer); if (H.log.length > 3000) H.log = H.log.slice(-3000); store.set('lc_log_' + roomId, H.log); }
+  function saveLog() { clearTimeout(saveTimer); saveTimer = setTimeout(flushLog, 400); }
+  function addFinal(k, name, hue, text, ts = Date.now(), save = true) {
+    const near = nearBottom();
+    const t = turnFor(k, name, hue, ts);
+    const s = document.createElement('span'); s.className = 'fin'; s.textContent = text + ' ';
+    t.said.append(s);
+    H.log.push({ k, n: name, h: hue, t: text, ts });
+    if (save) saveLog();
+    after(near);
+  }
+  function liveText(k, name, hue, u, text, final) {
+    const key = k + '|' + u;
+    let L = H.live.get(key);
+    const near = nearBottom();
+    if (!L) {
+      if (!text) return;
+      const turn = turnFor(k, name, hue, Date.now());
+      const span = document.createElement('span'); span.className = 'live';
+      turn.said.append(span);
+      L = { k, name, hue, u, span, turn }; H.live.set(key, L);
+    }
+    if (final) {
+      H.live.delete(key);
+      if (!text) {
+        L.span.remove();
+        if (!L.turn.said.childNodes.length) { L.turn.el.remove(); if (H.lastTurn === L.turn) H.lastTurn = null; }
+      } else {
+        L.span.className = 'fin'; L.span.textContent = text + ' ';
+        H.log.push({ k, n: name, h: hue, t: text, ts: Date.now() }); saveLog();
+      }
+    } else if (text) L.span.textContent = text + ' ';
+    renderChips();
+    after(near);
+  }
+  function finalizeLive(k) {
+    for (const L of [...H.live.values()]) if (L.k === k) liveText(k, L.name, L.hue, L.u, L.span.textContent.trim(), true);
+  }
+  function loadLog() {
+    const saved = store.get('lc_log_' + roomId, []);
+    if (Array.isArray(saved)) for (const e of saved) if (e && e.t) addFinal(e.k, e.n, e.h, e.t, e.ts, false);
+    toBottom();
+  }
+  loadLog();
+
+  /* people chips + status */
+  function isTalking(k) { for (const L of H.live.values()) if (L.k === k && L.span.textContent.trim()) return true; return false; }
+  function guestCount() { let n = 0; for (const [k, s] of H.speakers) if (k !== 'room' && s.conns.size) n++; return n; }
+  function renderChips() {
+    chips.textContent = '';
+    for (const [k, sp] of H.speakers) {
+      if (!sp.conns.size) continue;
+      const c = document.createElement('span'); c.className = 'chip' + (isTalking(k) ? ' talking' : '');
+      c.style.setProperty('--h', sp.hue);
+      const d = document.createElement('span'); d.className = 'dot';
+      const n = document.createElement('span'); n.textContent = sp.name;
+      c.append(d, n); chips.append(c);
+    }
+    const g = guestCount();
+    $('#inviteCount').textContent = g ? (g === 1 ? '1 person connected' : g + ' people connected') : 'Nobody connected yet';
+    setStatus();
+  }
+  function setStatus() {
+    const p = H.peer; let cls = 'warn', txt = 'Connecting…';
+    if (p && p.open && !p.disconnected) { cls = 'ok'; const g = guestCount(); txt = g ? g + ' connected' : 'Ready'; }
+    else if (p && p.disconnected) txt = 'Reconnecting…';
+    $('#dot').className = 'dot ' + cls; $('#status').textContent = txt;
+  }
+
+  /* invite / QR */
+  function joinUrl() { return location.origin + location.pathname + '?join=' + encodeURIComponent(roomId); }
+  function drawQR() {
+    const url = joinUrl();
+    const qr = qrcode(0, 'M'); qr.addData(url); qr.make();
+    $('#qr').innerHTML = qr.createSvgTag({ cellSize: 8, margin: 2, scalable: true });
+    $('#joinUrl').textContent = url;
+    const note = $('#inviteNote');
+    const local = /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
+    if (location.protocol === 'file:') { note.textContent = 'This page is open as a file, so phones can’t reach it. Put it on a website (https://) first.'; note.hidden = false; }
+    else if (location.protocol !== 'https:' || local) { note.textContent = 'Phones need an https:// web address for this to work. Open this page from its website address.'; note.hidden = false; }
+    else note.hidden = true;
+  }
+  const invite = $('#invite');
+  $('#bInvite').onclick = () => { invite.hidden = false; };
+  $('#bDone').onclick = () => { invite.hidden = true; };
+  invite.addEventListener('click', e => { if (e.target === invite) invite.hidden = true; });
+  const hn = $('#hostName'); hn.value = H.hostName;
+  hn.addEventListener('input', () => {
+    H.hostName = clip(hn.value, 30); store.set('lc_hostname', H.hostName);
+    for (const { conn } of H.conns.values()) safeSend(conn, { t: 'host', name: H.hostName });
+  });
+  drawQR();
+
+  /* rooms panel */
+  const roomsSheet = $('#rooms');
+  function renderRoomName() { $('#roomName').textContent = roomName(); $('#inviteRoom').textContent = roomName(); }
+  function openRoom(id) {
+    if (id === roomId || !rooms.some(r => r.id === id)) return;
+    flushLog();
+    if (H.roomMic && H.roomMic.want) H.roomMic.stop();
+    for (const rec of [...H.conns.values()]) dropConn(rec.conn); // their phones wait and rejoin when this room is opened again
+    feed.querySelectorAll('.turn').forEach(n => n.remove());
+    H.live.clear(); H.lastTurn = null; H.log = [];
+    $('#empty').hidden = false;
+    roomId = id; store.set('lc_room', roomId); H.idFails = 0;
+    loadLog(); drawQR(); renderRoomName(); hostConnect(); renderChips();
+  }
+  function renameRoom(r, input) {
+    r.name = clip(input.value, 40) || r.name; saveRooms(); renderRoomName(); renderRooms();
+  }
+  function deleteRoom(r) {
+    if (rooms.length < 2) return;
+    if (r.id === roomId) openRoom(rooms.find(x => x.id !== r.id).id);
+    rooms = rooms.filter(x => x !== r); saveRooms();
+    try { localStorage.removeItem('lc_log_' + r.id); } catch (e) {}
+    renderRooms();
+  }
+  function renderRooms() {
+    const list = $('#roomList'); list.textContent = '';
+    for (const r of rooms) {
+      const row = document.createElement('div'); row.className = 'roomrow' + (r.id === roomId ? ' current' : '');
+      const name = document.createElement('button'); name.type = 'button'; name.className = 'roomname'; name.textContent = r.name;
+      name.onclick = () => { openRoom(r.id); roomsSheet.hidden = true; };
+      row.append(name);
+      if (r.id === roomId) { const b = document.createElement('span'); b.className = 'badge'; b.textContent = 'OPEN NOW'; row.append(b); }
+      const ren = document.createElement('button'); ren.type = 'button'; ren.className = 'btn'; ren.textContent = 'Rename';
+      ren.onclick = () => {
+        const inp = document.createElement('input'); inp.value = r.name; inp.maxLength = 40; inp.setAttribute('aria-label', 'Room name');
+        name.replaceWith(inp); inp.focus(); inp.select();
+        ren.textContent = 'Save'; ren.onclick = () => renameRoom(r, inp);
+        inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); renameRoom(r, inp); } });
+      };
+      row.append(ren);
+      if (rooms.length > 1) {
+        const del = document.createElement('button'); del.type = 'button'; del.className = 'btn'; del.textContent = 'Delete';
+        let t = 0;
+        del.onclick = () => {
+          if (!del.dataset.armed) { del.dataset.armed = '1'; del.textContent = 'Tap to confirm'; del.style.color = 'var(--bad)'; t = setTimeout(renderRooms, 4000); return; }
+          clearTimeout(t); deleteRoom(r);
+        };
+        row.append(del);
+      }
+      list.append(row);
+    }
+  }
+  $('#bRooms').onclick = () => { renderRooms(); roomsSheet.hidden = false; };
+  $('#bRoomsDone').onclick = () => { roomsSheet.hidden = true; };
+  roomsSheet.addEventListener('click', e => { if (e.target === roomsSheet) roomsSheet.hidden = true; });
+  $('#addRoom').onsubmit = e => {
+    e.preventDefault();
+    const inp = $('#newRoomName');
+    const r = { id: PREFIX + rid(10), name: clip(inp.value, 40) || 'Room ' + (rooms.length + 1) };
+    rooms.push(r); saveRooms(); inp.value = '';
+    openRoom(r.id); roomsSheet.hidden = true; invite.hidden = false; // a new room needs people to scan in
+  };
+  renderRoomName();
+
+  /* menu */
+  const menu = $('#menu'), bMenu = $('#bMenu');
+  bMenu.onclick = e => { e.stopPropagation(); menu.hidden = !menu.hidden; bMenu.setAttribute('aria-expanded', String(!menu.hidden)); };
+  document.addEventListener('click', e => { if (!menu.hidden && !menu.contains(e.target)) { menu.hidden = true; bMenu.setAttribute('aria-expanded', 'false'); } });
+  menu.addEventListener('click', e => { if (e.target.tagName === 'BUTTON') menu.hidden = true; });
+  $('#bTheme').onclick = toggleTheme;
+  $('#bSave').onclick = () => {
+    const lines = H.log.map(e => '[' + hhmm(e.ts) + '] ' + e.n + ': ' + e.t);
+    const d = new Date(), p = x => String(x).padStart(2, '0');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([lines.join('\n') + '\n'], { type: 'text/plain' }));
+    a.download = 'captions-' + (roomName().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'room') + '-' + d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()) + '.txt';
+    document.body.append(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 3000);
+  };
+  $('#bClear').onclick = () => {
+    if (!confirm('Clear the whole transcript? This cannot be undone.')) return;
+    H.log = []; flushLog(); H.live.clear(); H.lastTurn = null;
+    feed.querySelectorAll('.turn').forEach(n => n.remove()); $('#empty').hidden = false;
+    const keep = {}; for (const [k, s] of H.speakers) if (s.conns.size) keep[k] = s.hue;
+    store.set('lc_hues', keep); renderChips();
+  };
+
+  /* room mic: lets the host device itself caption (e.g. for someone without a phone) */
+  function roomSpeaker() {
+    let sp = H.speakers.get('room');
+    if (!sp) { sp = { name: 'Room mic', hue: hueFor('room'), conns: new Set() }; H.speakers.set('room', sp); }
+    return sp;
+  }
+  $('#bRoom').onclick = () => {
+    if (!SR) { alert('This browser can’t turn speech into text. On iPad use Safari; on Android use Chrome.'); return; }
+    if (!H.roomMic) {
+      H.roomMic = new Listener({
+        lang: navigator.language || 'en-US',
+        onPartial: (u, t) => { const sp = roomSpeaker(); liveText('room', sp.name, sp.hue, u, t, false); },
+        onFinal: (u, t) => { const sp = roomSpeaker(); liveText('room', sp.name, sp.hue, u, t, true); },
+        onState: s => {
+          const sp = roomSpeaker();
+          if (s === 'on') sp.conns.add('local'); else { sp.conns.delete('local'); finalizeLive('room'); }
+          $('#bRoom').textContent = s === 'on' ? 'Stop room mic' : 'Room mic (this device listens)';
+          renderChips();
+        },
+        onError: e => { if (e === 'blocked') alert('Microphone access was blocked for this page.'); }
+      });
+    }
+    if (H.roomMic.want) H.roomMic.stop(); else H.roomMic.start();
+  };
+
+  /* replies from the deaf user to everyone's phones */
+  function safeSend(conn, m) { if (conn && conn.open) try { conn.send(m); } catch (e) {} }
+  function sendReply(text) {
+    text = clip(text, 1000); if (!text) return;
+    for (const { conn } of H.conns.values()) safeSend(conn, { t: 'reply', text, from: H.hostName });
+    addFinal('me', H.hostName ? H.hostName + ' (you)' : 'You', null, text);
+    toBottom();
+  }
+  const quick = $('#quick');
+  for (const q of ['Yes', 'No', 'Please repeat that', 'Slower, please', 'One at a time, please', 'Thank you!']) {
+    const b = document.createElement('button'); b.type = 'button'; b.className = 'btn'; b.textContent = q;
+    b.onclick = () => sendReply(q); quick.append(b);
+  }
+  $('#replyForm').onsubmit = e => { e.preventDefault(); const i = $('#replyIn'); sendReply(i.value); i.value = ''; };
+
+  /* networking */
+  function dropConn(conn) {
+    const rec = H.conns.get(conn.peer); if (!rec || rec.conn !== conn) return;
+    H.conns.delete(conn.peer); try { conn.close(); } catch (e) {}
+    if (rec.cid) { const sp = H.speakers.get(rec.cid); if (sp) { sp.conns.delete(conn.peer); if (!sp.conns.size) finalizeLive(rec.cid); } }
+    renderChips();
+  }
+  function onData(conn, m) {
+    const rec = H.conns.get(conn.peer);
+    if (!rec || rec.conn !== conn || !m || typeof m !== 'object') return;
+    rec.seen = Date.now();
+    if (m.t === 'hello') {
+      const cid = clip(m.cid, 40) || conn.peer;
+      if (cid === 'me' || cid === 'room') return;
+      const name = clip(m.name, 30) || 'Guest';
+      if (rec.cid && rec.cid !== cid) return;
+      rec.cid = cid;
+      let sp = H.speakers.get(cid);
+      if (!sp) { sp = { name, hue: hueFor(cid), conns: new Set() }; H.speakers.set(cid, sp); }
+      sp.name = name; sp.conns.add(conn.peer);
+      safeSend(conn, { t: 'welcome', hue: sp.hue, host: H.hostName });
+      renderChips(); return;
+    }
+    if (!rec.cid) return;
+    const sp = H.speakers.get(rec.cid); if (!sp) return;
+    if (m.t === 'partial' || m.t === 'final') liveText(rec.cid, sp.name, sp.hue, clip(m.u, 24), clip(m.text, 4000), m.t === 'final');
+    else if (m.t === 'typed') { const t = clip(m.text, 4000); if (t) addFinal(rec.cid, sp.name, sp.hue, t); }
+    else if (m.t === 'bye') dropConn(conn);
+  }
+  function hostConnect() {
+    if (H.peer && !H.peer.destroyed) try { H.peer.destroy(); } catch (e) {}
+    const peer = new Peer(roomId, { debug: 0 });
+    H.peer = peer; setStatus();
+    peer.on('open', () => { H.idFails = 0; setStatus(); });
+    peer.on('disconnected', setStatus);
+    peer.on('close', setStatus);
+    peer.on('connection', conn => {
+      H.conns.set(conn.peer, { conn, cid: null, seen: Date.now() });
+      conn.on('data', d => onData(conn, d));
+      conn.on('close', () => dropConn(conn));
+      conn.on('error', () => dropConn(conn));
+    });
+    peer.on('error', err => {
+      if (err.type === 'unavailable-id' || err.type === 'invalid-id') {
+        // the id may still be held for a few seconds after a reload; after a few tries, pick a new one
+        try { peer.destroy(); } catch (e) {}
+        if (++H.idFails >= 3 || err.type === 'invalid-id') {
+          flushLog();
+          const r = rooms.find(x => x.id === roomId), newId = PREFIX + rid(10);
+          store.set('lc_log_' + newId, H.log);
+          try { localStorage.removeItem('lc_log_' + roomId); } catch (e) {}
+          if (r) r.id = newId;
+          roomId = newId; store.set('lc_room', roomId); saveRooms(); H.idFails = 0; drawQR();
+        }
+      } else if (err.type === 'browser-incompatible') {
+        fatal('This browser can’t make live connections. Please use Safari, Chrome or Edge.');
+      }
+      setStatus();
+    });
+  }
+  setInterval(() => {
+    const p = H.peer;
+    if (!p || p.destroyed) hostConnect();
+    else if (p.disconnected) try { p.reconnect(); } catch (e) {}
+    const now = Date.now();
+    for (const rec of [...H.conns.values()]) if (now - rec.seen > 25000) dropConn(rec.conn);
+    setStatus();
+  }, 4000);
+  hostConnect();
+  renderChips();
+  keepAwake(true);
+  document.addEventListener('click', () => keepAwake(true), { once: true });
+}
+
+/* ======================= GUEST (a speaker's phone) ======================= */
+function startGuest() {
+  mount('tpl-guest');
+  let cid = store.get('lc_cid', '');
+  if (!/^c[a-z0-9]{8,20}$/.test(cid)) { cid = 'c' + rid(12); store.set('lc_cid', cid); }
+  const G = { name: store.get('lc_name', ''), lang: store.get('lc_lang', ''), peer: null, conn: null, connAt: 0, waiting: false, joined: false, queue: [], hist: [], host: '' };
+  if (!G.lang) { const nl = navigator.language || 'en-US'; G.lang = (LANGS.find(l => l[0] === nl) || LANGS.find(l => l[0].slice(0, 2) === nl.slice(0, 2)) || LANGS[0])[0]; }
+  const wrap = $('.gwrap');
+  const sel = $('#gLang');
+  for (const [code, label] of LANGS) { const o = document.createElement('option'); o.value = code; o.textContent = label; sel.append(o); }
+  sel.value = G.lang;
+  $('#gName').value = G.name;
+
+  const warns = [];
+  if (!SR) warns.push('This browser can’t turn speech into text (on Android use Chrome, on iPhone use Safari). You can still type messages.');
+  else if (!window.isSecureContext) warns.push('The microphone only works from an https:// address. You can still type messages.');
+  if (warns.length) { $('#gWarn').textContent = warns.join(' '); $('#gWarn').hidden = false; }
+  if (!SR) { $('#gJoinBtn').textContent = 'Join'; $('#gMic').hidden = true; }
+
+  const hint = $('#gHint');
+  function setHint(t, bad) { hint.textContent = t; hint.className = 'hint' + (bad ? ' bad' : ''); }
+  const listener = SR ? new Listener({
+    lang: G.lang,
+    onPartial: (u, t) => { send({ t: 'partial', u, text: t }); $('#gLive').textContent = t; if (hint.classList.contains('bad')) renderMic(); },
+    onFinal: (u, t) => { send({ t: 'final', u, text: t }); pushHist(t); $('#gLive').textContent = ''; },
+    onState: () => renderMic(),
+    onError: e => {
+      if (e === 'blocked') setHint('The microphone is blocked. Allow it for this site in your browser settings, then tap the mic.', true);
+      else if (e === 'network') setHint('Speech service can’t be reached — retrying…', true);
+      else setHint('Speech problem (' + e + ') — retrying…', true);
+    }
+  }) : null;
+
+  function renderMic() {
+    const on = !!(listener && listener.want);
+    $('#gMic').classList.toggle('on', on);
+    $('#gMic').setAttribute('aria-pressed', String(on));
+    setHint(on ? 'Listening — speak normally. Keep this screen open. Tap to pause.' : 'Paused. Tap the microphone to talk.');
+    keepAwake(on);
+  }
+  function pushHist(t) {
+    G.hist.push(t); if (G.hist.length > 3) G.hist.shift();
+    const h = $('#gHist'); h.textContent = '';
+    for (const x of G.hist) { const d = document.createElement('div'); d.className = 'old'; d.textContent = x; h.append(d); }
+  }
+  function renderMe() {
+    const me = $('#gMe'); me.textContent = G.name + ' ✎';
+    wrap.style.setProperty('--h', G.hue == null ? 205 : G.hue);
+    me.style.setProperty('--h', G.hue == null ? 205 : G.hue);
+  }
+  function setG() {
+    let cls = 'warn', txt = 'Connecting…';
+    if (G.conn && G.conn.open) { cls = 'ok'; txt = 'Connected — your words appear on ' + (G.host ? G.host + '’s' : 'their') + ' screen'; }
+    else if (G.waiting) txt = 'Waiting for this room to open on the captions screen… You’ll reconnect by yourself.';
+    $('#gDot').className = 'dot ' + cls; $('#gStatus').textContent = txt;
+  }
+  function send(m) {
+    if (G.conn && G.conn.open) { try { G.conn.send(m); return; } catch (e) {} }
+    if ((m.t === 'final' || m.t === 'typed') && m.text) { G.queue.push(m); if (G.queue.length > 50) G.queue.shift(); }
+  }
+  function onMsg(m) {
+    if (!m || typeof m !== 'object') return;
+    if (m.t === 'welcome') { G.hue = HUES.includes(m.hue) ? m.hue : null; G.host = clip(m.host, 30); renderMe(); setG(); }
+    else if (m.t === 'host') { G.host = clip(m.name, 30); setG(); }
+    else if (m.t === 'reply') {
+      G.host = clip(m.from, 30) || G.host;
+      $('#gReplyFrom').textContent = (G.host || 'They') + ' wrote:';
+      $('#gReplyText').textContent = clip(m.text, 1000);
+      $('#gReply').hidden = false;
+      try { navigator.vibrate && navigator.vibrate([120, 60, 120]); } catch (e) {}
+    }
+  }
+  function ensurePeer() {
+    if (G.peer && !G.peer.destroyed) { if (G.peer.disconnected) try { G.peer.reconnect(); } catch (e) {} return G.peer.open; }
+    const p = new Peer({ debug: 0 }); G.peer = p;
+    p.on('open', () => tick());
+    p.on('error', err => {
+      if (err.type === 'peer-unavailable') { G.waiting = true; if (G.conn) { try { G.conn.close(); } catch (e) {} G.conn = null; } }
+      else if (err.type === 'browser-incompatible') fatal('This browser can’t make live connections. Please use Chrome or Safari.');
+      setG();
+    });
+    return false;
+  }
+  function tick() {
+    if (!G.joined) return;
+    if (G.conn && G.conn.open) { send({ t: 'ping' }); return; }
+    if (!ensurePeer()) { setG(); return; }
+    if (G.conn && Date.now() - G.connAt < 10000) return; // still trying
+    if (G.conn) try { G.conn.close(); } catch (e) {}
+    const c = G.peer.connect(joinId, { reliable: true });
+    G.conn = c; G.connAt = Date.now();
+    c.on('open', () => {
+      if (G.conn !== c) return;
+      G.waiting = false;
+      c.send({ t: 'hello', cid, name: G.name });
+      while (G.queue.length) c.send(G.queue.shift());
+      setG();
+    });
+    c.on('data', onMsg);
+    c.on('close', () => { if (G.conn === c) { G.conn = null; setG(); setTimeout(tick, 500); } });
+    c.on('error', () => { if (G.conn === c) { G.conn = null; setG(); } });
+  }
+  setInterval(tick, 3000);
+  addEventListener('pagehide', () => { if (G.conn && G.conn.open) try { G.conn.send({ t: 'bye' }); } catch (e) {} });
+
+  function join() {
+    const name = clip($('#gName').value, 30);
+    if (!name) { $('#gName').focus(); $('#gName').placeholder = 'Please type your name'; return; }
+    const langChanged = sel.value !== G.lang;
+    G.name = name; G.lang = sel.value; store.set('lc_name', name); store.set('lc_lang', G.lang);
+    $('#gJoin').hidden = true; $('#gMain').hidden = false; renderMe();
+    if (!G.joined) {
+      G.joined = true; setG(); tick();
+      if (listener) listener.start(); // inside the tap, so the browser can ask for the mic
+      else setHint('Type below — your messages appear on their screen.');
+    } else {
+      send({ t: 'hello', cid, name: G.name });
+      if (listener && langChanged) listener.setLang(G.lang);
+    }
+  }
+  $('#gJoinBtn').onclick = join;
+  $('#gName').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); join(); } });
+  $('#gMe').onclick = () => { $('#gJoinBtn').textContent = 'Save'; $('#gJoin').hidden = false; $('#gMain').hidden = true; };
+  $('#gMic').onclick = () => { if (!listener) return; if (listener.want) listener.stop(); else listener.start(); };
+  $('#gTypeForm').onsubmit = e => {
+    e.preventDefault();
+    const i = $('#gType'), t = clip(i.value, 1000); if (!t) return;
+    send({ t: 'typed', text: t }); pushHist('⌨ ' + t); i.value = '';
+  };
+}
+
+/* ======================= boot ======================= */
+if (typeof Peer === 'undefined' || typeof qrcode === 'undefined') fatal('Couldn’t load the connection tools. Check the internet connection and reload the page.');
+else if (joinId) startGuest();
+else startHost();
+</script>
+</body>
+</html>
