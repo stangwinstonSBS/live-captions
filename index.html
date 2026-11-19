@@ -211,6 +211,11 @@ const joinId = (params.get('join') || '').trim();
 const PREFIX = 'lc-';
 const HUES = [205, 30, 130, 330, 55, 270, 175, 0, 95, 240];
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const APP_V = 5; // bump on every update: phones on an older version reload themselves
+// whose speech engine this browser uses: Apple's (every iPhone/iPad browser, Mac Safari) or Google's.
+// Their confidence scores run on different scales, so they're only compared like-for-like.
+const ENGINE = (/iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) ||
+  (/Safari/.test(navigator.userAgent) && !/Chrome|Chromium|Edg|Android/.test(navigator.userAgent))) ? 'apple' : 'google';
 const LANGS = [['en-US','English (US)'],['en-GB','English (UK)'],['es-US','Español (EE. UU.)'],['es-MX','Español (México)'],['es-ES','Español (España)'],['fr-FR','Français'],['de-DE','Deutsch'],['it-IT','Italiano'],['pt-BR','Português (Brasil)'],['zh-CN','中文 (普通话)'],['zh-TW','中文 (台灣)'],['ja-JP','日本語'],['ko-KR','한국어'],['ru-RU','Русский'],['uk-UA','Українська'],['ar-SA','العربية'],['hi-IN','हिन्दी'],['vi-VN','Tiếng Việt']];
 
 function rid(n) { const a = 'abcdefghjkmnpqrstuvwxyz23456789'; let s = ''; for (const x of crypto.getRandomValues(new Uint8Array(n))) s += a[x % a.length]; return s; }
@@ -462,8 +467,26 @@ function startHost() {
     for (let i = H.recent.length - 1; i >= 0; i--) { const r = H.recent[i]; if (r.k !== c.k && now - r.at < win && similar(r.words, c.words)) return r; }
     return null;
   }
+  /* Each phone is judged against its own normal: its average confidence over its last 40 sentences.
+     The phone in front of the speaker hears them better than it usually hears people, so it scores
+     above its own average; a phone across the table scores below its own. This works even when
+     the phones use different speech engines (Apple's scores run lower than Google's). */
+  H.confs = new Map();
+  function noteConf(k, conf) {
+    if (!(conf > 0)) return;
+    const a = H.confs.get(k) || []; a.push(conf); if (a.length > 40) a.shift(); H.confs.set(k, a);
+  }
+  function relConf(c) {
+    const a = H.confs.get(c.k);
+    if (!(c.conf > 0) || !a || a.length < 4) return null; // not enough to know this phone's normal yet
+    return c.conf - a.reduce((s, x) => s + x, 0) / a.length;
+  }
   function beats(c, r) {
-    if (c.conf > 0 && r.conf > 0 && Math.abs(c.conf - r.conf) > 0.05) return c.conf > r.conf;
+    if (c.conf > 0 && r.conf > 0) {
+      const rc = relConf(c), rr = relConf(r);
+      if (rc != null && rr != null && Math.abs(rc - rr) > 0.03) return rc > rr;
+      if (c.eg === r.eg && Math.abs(c.conf - r.conf) > 0.05) return c.conf > r.conf; // same engine: raw scores compare fairly
+    }
     if (c.words.length !== r.words.length) return c.words.length > r.words.length;
     return false; // a tie goes to whoever was first
   }
@@ -479,7 +502,7 @@ function startHost() {
     H.recent = H.recent.filter(x => x !== r);
     saveLog();
   }
-  function liveText(k, name, hue, u, text, final, conf = 0) {
+  function liveText(k, name, hue, u, text, final, conf = 0, eg = 'google') {
     const key = k + '|' + u;
     let L = H.live.get(key);
     const near = nearBottom();
@@ -495,10 +518,14 @@ function startHost() {
     if (L.span.parentNode === L.turn.line) L.turn.lineAt = L.at; // still talking: the pause is measured from here
     if (final) {
       H.live.delete(key);
-      const cand = { k, words: wordsOf(text), conf, at: Date.now() };
+      const cand = { k, words: wordsOf(text), conf, eg, at: Date.now() };
+      if (text) noteConf(k, conf);
       const S = SENS[H.sens], on = H.sens !== 'off';
       const dup = text && on ? findDup(cand) : null;
-      const faint = on && !dup && k !== 'room' && S.floor && conf > 0 && conf < S.floor;
+      const rel = relConf(cand);
+      // Strict only: a sentence no other phone sent, heard well below this phone's normal (or, before
+      // its normal is known, a low Google score) is treated as far-away speech
+      const faint = on && !dup && k !== 'room' && S.floor && conf > 0 && (rel != null ? rel < -0.2 : (eg === 'google' && conf < S.floor));
       if (!text || faint || (dup && !beats(cand, dup))) {
         removeSpan(L.turn, L.span); // empty, or someone else's phone already has this sentence, heard better
       } else {
@@ -710,7 +737,7 @@ function startHost() {
       H.roomMic = new Listener({
         lang: navigator.language || 'en-US',
         onPartial: (u, t) => { const sp = roomSpeaker(); liveText('room', sp.name, sp.hue, u, t, false); },
-        onFinal: (u, t, cf) => { const sp = roomSpeaker(); liveText('room', sp.name, sp.hue, u, t, true, cf); },
+        onFinal: (u, t, cf) => { const sp = roomSpeaker(); liveText('room', sp.name, sp.hue, u, t, true, cf, ENGINE); },
         onState: s => {
           const sp = roomSpeaker();
           if (s === 'on') sp.conns.add('local'); else { sp.conns.delete('local'); finalizeLive('room'); }
@@ -753,7 +780,7 @@ function startHost() {
       if (!sp) { sp = { name, hue: hueFor(cid), conns: new Set() }; H.speakers.set(cid, sp); }
       const changed = fresh || sp.name !== name;
       sp.name = name; sp.seen = now; sp.conns.add('net');
-      hostSend(cid, fresh || m.t === 'hello' ? { t: 'welcome', hue: sp.hue, host: H.hostName } : { t: 'pong' });
+      hostSend(cid, fresh || m.t === 'hello' ? { t: 'welcome', hue: sp.hue, host: H.hostName, v: APP_V } : { t: 'pong', v: APP_V });
       if (changed) renderChips();
       return;
     }
@@ -772,7 +799,7 @@ function startHost() {
       if (H.done.has(key)) return;      // a resend (or the copy from the second relay) we already have
       H.done.add(key); H.seq.delete(key); if (H.done.size > 5000) H.done.clear();
       const t = clip(m.text, 4000);
-      if (m.t === 'final') liveText(cid, sp.name, sp.hue, u, t, true, Math.max(0, Math.min(1, +m.cf || 0)));
+      if (m.t === 'final') liveText(cid, sp.name, sp.hue, u, t, true, Math.max(0, Math.min(1, +m.cf || 0)), m.eg === 'apple' ? 'apple' : 'google');
       else if (t) addFinal(cid, sp.name, sp.hue, t);
     } else if (m.t === 'bye') { sp.conns.delete('net'); renderChips(); }
   }
@@ -817,6 +844,13 @@ function startGuest() {
   else if (!window.isSecureContext) warns.push('The microphone only works from an https:// address. You can still type messages.');
   if (warns.length) { $('#gWarn').textContent = warns.join(' '); $('#gWarn').hidden = false; }
   if (!SR) { $('#gJoinBtn').textContent = 'Join'; $('#gMic').hidden = true; }
+  // just reloaded itself for an update: one tap gets back in (the mic needs a tap to start)
+  let upd = ''; try { upd = sessionStorage.getItem('lc_upd') || ''; } catch (e) {}
+  if (upd === String(APP_V) && G.name) {
+    try { sessionStorage.setItem('lc_upd', 'shown-' + APP_V); } catch (e) {}
+    const n = $('#gWarn'); n.textContent = 'The app was just updated. Tap the button below to keep going.' + (warns.length ? ' ' + warns.join(' ') : '');
+    n.hidden = false; $('#gJoinBtn').textContent = 'Keep going';
+  }
 
   const hint = $('#gHint');
   function setHint(t, bad) { hint.textContent = t; hint.className = 'hint' + (bad ? ' bad' : ''); }
@@ -887,7 +921,7 @@ function startGuest() {
   function sendFinal(t, u, text, cf) {
     if (!text) return;
     if (G.pending && G.pending.u === u) G.pending = null;
-    G.outbox.set(u, { m: { t, u, text, cf: +(cf || 0).toFixed(3) }, at: 0 });
+    G.outbox.set(u, { m: { t, u, text, cf: +(cf || 0).toFixed(3), eg: ENGINE }, at: 0 });
     while (G.outbox.size > 100) G.outbox.delete(G.outbox.keys().next().value);
     flushOutbox();
   }
@@ -897,6 +931,16 @@ function startGuest() {
   }
   function onMsg(topic, m) {
     if (!m || typeof m !== 'object') return;
+    // the captions screen runs a newer version of the app: reload once to pick it up
+    if (typeof m.v === 'number' && m.v > APP_V) {
+      let tried = ''; try { tried = sessionStorage.getItem('lc_upd') || ''; } catch (e) {}
+      if (tried !== String(m.v)) {
+        try { sessionStorage.setItem('lc_upd', String(m.v)); } catch (e) {}
+        flushOutbox(true);
+        setTimeout(() => location.reload(), 400);
+        return;
+      }
+    }
     const was = linked();
     G.lastHeard = Date.now(); G.everLinked = true;
     if (!was) { flushOutbox(true); setG(); } // back in touch: send anything still waiting
