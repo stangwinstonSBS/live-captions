@@ -113,6 +113,13 @@ h1{font-size:1.5em;margin:0 0 .3em}
 .typeform{display:flex;gap:8px;margin-top:auto}
 .typeform input{flex:1;min-width:0;border:1px solid var(--line);border-radius:10px;padding:.55em .8em;background:var(--panel);font-size:18px}
 .warn{color:var(--warn);font-weight:600}
+.meter{position:relative;height:8px;border-radius:4px;background:var(--line);width:min(260px,70%);margin:0 auto}
+.meter i{position:absolute;left:0;top:0;bottom:0;width:0;border-radius:4px;background:hsl(var(--h),70%,46%);transition:width .08s linear}
+.meter b{position:absolute;top:-4px;bottom:-4px;width:3px;margin-left:-1px;border-radius:2px;background:var(--fg)}
+.check{text-align:center;display:flex;flex-direction:column;gap:8px}
+.check .say{font-size:22px;font-weight:700;margin:0;line-height:1.3}
+.linkbtn{background:none;border:0;color:var(--accent);font:inherit;font-size:14px;cursor:pointer;margin:0 auto;padding:6px;display:block}
+.small{font-size:13px;text-align:center}
 .fatal{max-width:480px;margin:20vh auto;font-size:18px}
 @media (prefers-reduced-motion:reduce){*{animation:none!important}}
 </style>
@@ -195,6 +202,16 @@ h1{font-size:1.5em;margin:0 0 .3em}
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><path d="M12 17v4"/><path d="M8 21h8"/></svg>
     </button>
     <p id="gHint" class="hint"></p>
+    <div id="gMeter" class="meter" hidden aria-hidden="true" title="How loud your phone hears you. The black mark is your normal voice."><i></i><b hidden></b></div>
+    <div id="gCheck" class="card check" hidden>
+      <b>Voice check</b>
+      <p class="lead">So the captions can tell your voice from others nearby: put your phone where it will sit while you talk, and read this out loud in your normal voice.</p>
+      <p id="gSay" class="say"></p>
+      <p id="gCheckMsg" class="lead"></p>
+      <button id="gSkip" class="btn" type="button">Skip</button>
+    </div>
+    <p id="gMeterNote" class="lead small" hidden></p>
+    <button id="gRecheck" class="linkbtn" type="button" hidden>Redo voice check</button>
     <div class="heard"><div id="gHist"></div><div id="gLive" class="livebig"></div><div id="gLegend" class="legend" hidden>✓ = on their screen · … = still sending</div></div>
     <form id="gTypeForm" class="typeform"><input id="gType" placeholder="Or type a message…" autocomplete="off" enterkeyhint="send" maxlength="1000"><button class="btn">Send</button></form>
   </section>
@@ -213,7 +230,7 @@ const joinId = (params.get('join') || '').trim();
 const PREFIX = 'lc-';
 const HUES = [205, 30, 130, 330, 55, 270, 175, 0, 95, 240];
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-const APP_V = 6; // bump on every update: phones on an older version reload themselves
+const APP_V = 7; // bump on every update: phones on an older version reload themselves
 // whose speech engine this browser uses: Apple's (every iPhone/iPad browser, Mac Safari) or Google's.
 // Their confidence scores run on different scales, so they're only compared like-for-like.
 const ENGINE = (/iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) ||
@@ -251,6 +268,7 @@ document.addEventListener('visibilitychange', () => { if (document.visibilitySta
 class Listener {
   constructor(o) {
     this.o = o; this.lang = o.lang; this.want = false; this.rec = null; this.errs = 0; this.n = 0; this.prefix = rid(4);
+    this.track = null; this.useTrack = true; // newer Chrome can listen through the loudness meter's own microphone
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && this.want && !this.rec) this._spawn(); });
   }
   start() { if (!SR) return; this.want = true; this.errs = 0; if (!this.rec) this._spawn(); this.o.onState('on'); }
@@ -277,6 +295,7 @@ class Listener {
     };
     r.onerror = e => {
       const k = e.error;
+      if (k === 'audio-capture' && this.track && this.useTrack) { this.useTrack = false; return; } // that didn't work: use its own mic
       if (k === 'not-allowed' || k === 'service-not-allowed') { this.want = false; this.o.onState('off'); this.o.onError('blocked'); }
       else if (k !== 'no-speech' && k !== 'aborted') { this.errs++; this.o.onError(k); }
     };
@@ -288,8 +307,55 @@ class Listener {
         setTimeout(() => { if (this.want && !this.rec) this._spawn(); }, d);
       }
     };
-    try { r.start(); }
-    catch (e) { this.rec = null; this.errs++; setTimeout(() => { if (this.want && !this.rec) this._spawn(); }, 1000); }
+    const t = this.track && this.useTrack && this.track.readyState === 'live' ? this.track : null;
+    try { if (t) r.start(t); else r.start(); }
+    catch (e) {
+      if (t) { this.useTrack = false; try { r.start(); return; } catch (e2) {} }
+      this.rec = null; this.errs++; setTimeout(() => { if (this.want && !this.rec) this._spawn(); }, 1000);
+    }
+  }
+}
+
+/* Loudness meter: how loud the sound is at this phone, 20 times a second. The person in front of
+   a phone is far louder at it than someone across the table (about 6 dB quieter per doubling of
+   distance), so each sentence's loudness, compared with the owner's own voice level, tells whether
+   the owner said it. Automatic volume levelling is switched off so the difference survives. */
+class Meter {
+  constructor() { this.ok = false; this.busy = false; this.frames = []; this.last = -120; this.stream = null; this.ctx = null; this.timer = 0; this.startedAt = 0; }
+  get track() { return this.stream ? this.stream.getAudioTracks()[0] || null : null; }
+  start() { // call from a tap
+    if (this.ok || this.busy) return Promise.resolve(this.ok);
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return Promise.resolve(false);
+    this.busy = true;
+    try { this.ctx = new AC(); this.ctx.resume(); } catch (e) { this.busy = false; return Promise.resolve(false); }
+    return navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } }).then(s => {
+      this.stream = s;
+      const an = this.ctx.createAnalyser(); an.fftSize = 1024;
+      this.ctx.createMediaStreamSource(s).connect(an);
+      const buf = new Float32Array(an.fftSize);
+      this.timer = setInterval(() => {
+        if (this.ctx.state === 'suspended') try { this.ctx.resume(); } catch (e) {}
+        an.getFloatTimeDomainData(buf);
+        let p = 0; for (let i = 0; i < buf.length; i++) p += buf[i] * buf[i];
+        const now = Date.now(), db = 10 * Math.log10(p / buf.length + 1e-13);
+        this.last = db; this.frames.push([now, db]);
+        while (this.frames.length && now - this.frames[0][0] > 30000) this.frames.shift();
+      }, 50);
+      this.ok = true; this.busy = false; this.startedAt = Date.now(); return true;
+    }).catch(() => { this.busy = false; this.stop(); return false; });
+  }
+  stop() {
+    clearInterval(this.timer); this.timer = 0;
+    if (this.stream) for (const t of this.stream.getTracks()) t.stop();
+    if (this.ctx) try { this.ctx.close(); } catch (e) {}
+    this.stream = null; this.ctx = null; this.ok = false; this.frames = []; this.last = -120;
+  }
+  // how loud the speech was between two times: the level the loudest 10% of moments reach
+  level(t0, t1) {
+    const a = []; for (const f of this.frames) if (f[0] >= t0 && f[0] <= t1) a.push(f[1]);
+    if (a.length < 6) return null;
+    a.sort((x, y) => x - y); return a[Math.floor(a.length * 0.9)];
   }
 }
 
@@ -447,10 +513,13 @@ function startHost() {
                treated as far-away speech and hidden (0 = unknown confidence, never hidden) */
   const SENS = {
     off:    { label: 'Off',    help: 'Every phone’s text is shown, even when two phones heard the same thing.' },
-    gentle: { label: 'Gentle', window: 6000,  overlap: 0.75, minWords: 4, floor: 0,   help: 'Merges only near-identical repeats. Least likely to hide anything.' },
-    normal: { label: 'Normal', window: 10000, overlap: 0.6,  minWords: 3, floor: 0,   help: 'Merges sentences that two phones both heard, keeping the clearer one.' },
-    strict: { label: 'Strict', window: 15000, overlap: 0.45, minWords: 2, floor: 0.5, help: 'Merges more eagerly and also hides faint, far-away speech. May drop a quiet speaker.' }
+    gentle: { label: 'Gentle', window: 6000,  overlap: 0.75, minWords: 4, floor: 0,   quiet: -20, help: 'Hides only speech far quieter than the phone’s owner. Least likely to hide anything.' },
+    normal: { label: 'Normal', window: 10000, overlap: 0.6,  minWords: 3, floor: 0,   quiet: -13, help: 'Hides speech much quieter than the phone’s owner, and merges sentences two phones both heard.' },
+    strict: { label: 'Strict', window: 15000, overlap: 0.45, minWords: 2, floor: 0.5, quiet: -9,  help: 'Hides anything clearly quieter than the phone’s owner. May drop someone who talks softly.' }
   };
+  /* quiet – dB below the owner's own voice (from their phone's voice check) at which a sentence is
+             taken to be someone else's voice and hidden. Phones that can't measure loudness fall back
+             to the confidence rules. */
   H.sens = store.get('lc_sens', store.get('lc_dedupe', true) === false ? 'off' : 'normal');
   if (!SENS[H.sens]) H.sens = 'normal';
   H.recent = [];
@@ -484,6 +553,8 @@ function startHost() {
     return c.conf - a.reduce((s, x) => s + x, 0) / a.length;
   }
   function beats(c, r) {
+    // both phones measured loudness: whoever's owner it sounds more like gets it
+    if (c.lv != null && r.lv != null && Math.abs(c.lv - r.lv) >= 3) return c.lv > r.lv;
     if (c.conf > 0 && r.conf > 0) {
       const rc = relConf(c), rr = relConf(r);
       if (rc != null && rr != null && Math.abs(rc - rr) > 0.03) return rc > rr;
@@ -504,12 +575,14 @@ function startHost() {
     H.recent = H.recent.filter(x => x !== r);
     saveLog();
   }
-  function liveText(k, name, hue, u, text, final, conf = 0, eg = 'google') {
+  function liveText(k, name, hue, u, text, final, conf = 0, eg = 'google', lv = null) {
     const key = k + '|' + u;
     let L = H.live.get(key);
     const near = nearBottom();
+    const tooQuiet = lv != null && H.sens !== 'off' && k !== 'room' && lv < SENS[H.sens].quiet;
     if (!L) {
       if (!text) return;
+      if (tooQuiet) return; // someone else's voice at this phone: don't show it at all
       const now = Date.now();
       const turn = turnFor(k, name, hue, now);
       const span = document.createElement('span'); span.className = 'live';
@@ -520,14 +593,15 @@ function startHost() {
     if (L.span.parentNode === L.turn.line) L.turn.lineAt = L.at; // still talking: the pause is measured from here
     if (final) {
       H.live.delete(key);
-      const cand = { k, words: wordsOf(text), conf, eg, at: Date.now() };
+      const cand = { k, words: wordsOf(text), conf, eg, lv, at: Date.now() };
       if (text) noteConf(k, conf);
       const S = SENS[H.sens], on = H.sens !== 'off';
       const dup = text && on ? findDup(cand) : null;
       const rel = relConf(cand);
-      // Strict only: a sentence no other phone sent, heard well below this phone's normal (or, before
-      // its normal is known, a low Google score) is treated as far-away speech
-      const faint = on && !dup && k !== 'room' && S.floor && conf > 0 && (rel != null ? rel < -0.2 : (eg === 'google' && conf < S.floor));
+      // far-away speech: much quieter than the phone's owner; or, for phones that can't measure
+      // loudness, (Strict only) a sentence no other phone sent, heard well below this phone's normal
+      const faint = lv != null ? tooQuiet
+        : on && !dup && k !== 'room' && S.floor && conf > 0 && (rel != null ? rel < -0.2 : (eg === 'google' && conf < S.floor));
       if (!text || faint || (dup && !beats(cand, dup))) {
         removeSpan(L.turn, L.span); // empty, or someone else's phone already has this sentence, heard better
       } else {
@@ -796,6 +870,7 @@ function startHost() {
 
   /* networking: phones write to <room>/h; the screen answers each phone on <room>/g/<phone id>
      and everyone on <room>/all. Phones ping every 2 s; a phone silent for 15 s is shown as gone. */
+  const lvOf = m => typeof m.lv === 'number' && isFinite(m.lv) ? Math.max(-80, Math.min(40, m.lv)) : null;
   function onMsg(topic, m) {
     if (topic !== TOPIC + roomId + '/h' || !m || typeof m !== 'object') return;
     const cid = clip(m.c, 40); if (!/^c[a-z0-9]{8,20}$/.test(cid)) return;
@@ -826,14 +901,14 @@ function startHost() {
       if (H.done.has(key)) return;
       const s = +m.s || 0; if (s < (H.seq.get(key) || 0)) return; // an older guess arriving late
       H.seq.set(key, s);
-      liveText(cid, sp.name, sp.hue, u, clip(m.text, 4000), false);
+      liveText(cid, sp.name, sp.hue, u, clip(m.text, 4000), false, 0, 'google', lvOf(m));
     } else if (m.t === 'final' || m.t === 'typed') {
       if (!u) return;
       hostSend(cid, { t: 'ack', u });   // receipt, so the phone stops resending
       if (H.done.has(key)) return;      // a resend (or the copy from the second relay) we already have
       H.done.add(key); H.seq.delete(key); if (H.done.size > 5000) H.done.clear();
       const t = clip(m.text, 4000);
-      if (m.t === 'final') liveText(cid, sp.name, sp.hue, u, t, true, Math.max(0, Math.min(1, +m.cf || 0)), m.eg === 'apple' ? 'apple' : 'google');
+      if (m.t === 'final') liveText(cid, sp.name, sp.hue, u, t, true, Math.max(0, Math.min(1, +m.cf || 0)), m.eg === 'apple' ? 'apple' : 'google', lvOf(m));
       else if (t) addFinal(cid, sp.name, sp.hue, t);
     } else if (m.t === 'bye') { sp.conns.delete('net'); renderChips(); }
   }
@@ -888,10 +963,113 @@ function startGuest() {
 
   const hint = $('#gHint');
   function setHint(t, bad) { hint.textContent = t; hint.className = 'hint' + (bad ? ' bad' : ''); }
+  /* the owner's voice level at this phone (dB), from the voice check, kept up to date as they talk */
+  const meter = new Meter();
+  G.voice = store.get('lc_voice', null); if (!(G.voice && isFinite(G.voice.db))) G.voice = null;
+  G.levels = []; G.uStart = new Map(); G.lastSR = 0; G.checking = null;
+  function levelFor(u) {
+    if (!meter.ok) return null;
+    const now = Date.now(), s = G.uStart.get(u) || now - 3000;
+    const db = meter.level(s - 1000, now); // speech starts a little before the first words come back
+    return db == null || db < -100 ? null : db;
+  }
+  const relTo = db => db == null || !G.voice ? null : Math.round((db - G.voice.db) * 10) / 10;
+  function learn(db) {
+    if (db == null) return;
+    G.levels.push(db); if (G.levels.length > 30) G.levels.shift();
+    if (!G.voice || G.voice.auto) {
+      // no voice check: assume the owner is usually the loudest voice at their own phone
+      if (G.levels.length >= 5) { const a = [...G.levels].sort((x, y) => x - y); G.voice = { db: a[Math.floor(a.length * 0.8)], auto: true }; }
+    } else if (db - G.voice.db > -4) { G.voice.db += 0.1 * (db - G.voice.db); store.set('lc_voice', G.voice); }
+  }
+  function noteStart(u) {
+    if (G.uStart.has(u)) return;
+    G.uStart.set(u, Date.now());
+    if (G.uStart.size > 40) G.uStart.delete(G.uStart.keys().next().value);
+  }
+  const SAY = ['I’m setting up my phone so the captions know my voice.', 'This is my voice, and this phone belongs to me.', 'Testing my phone so my words show up under my name.'];
+  function startCheck() {
+    if (!meter.ok) return;
+    G.checking = { words: 0, dbs: [] };
+    $('#gSay').textContent = '“' + SAY[Math.floor(Math.random() * SAY.length)] + '”';
+    $('#gCheckMsg').textContent = 'Listening…';
+    $('#gCheck').hidden = false; $('#gRecheck').hidden = true;
+  }
+  function feedCheck(t, db) {
+    const c = G.checking;
+    c.words += t.split(/\s+/).filter(Boolean).length; if (db != null) c.dbs.push(db);
+    if (c.words >= 6 && c.dbs.length) {
+      c.dbs.sort((x, y) => x - y);
+      G.voice = { db: c.dbs[Math.floor((c.dbs.length - 1) / 2)] }; G.levels = []; store.set('lc_voice', G.voice);
+      endCheck('Got it ✓ Your phone now knows your voice level.');
+    } else $('#gCheckMsg').textContent = c.words ? 'Keep going…' : 'Listening…';
+  }
+  function endCheck(msg) {
+    G.checking = null; $('#gCheckMsg').textContent = msg;
+    setTimeout(() => { if (!G.checking) { $('#gCheck').hidden = true; renderMeter(); } }, msg ? 1800 : 0);
+  }
+  function startMeter(mode) { // 'join' | 'resume' | 'force' — always called from a tap
+    if (!SR) return;
+    if (mode === 'force') store.set('lc_meter_bad', '');
+    else if (store.get('lc_meter_bad', '')) { renderMeter(); return; }
+    meter.start().then(ok => {
+      if (!ok) { renderMeter(); return; }
+      if (listener && ENGINE === 'google') { listener.track = meter.track; listener.useTrack = true; }
+      G.lastSR = Date.now();
+      if (mode === 'force' || (mode === 'join' && (!G.voice || G.voice.auto))) startCheck();
+      renderMeter();
+    });
+  }
+  function meterFail(why) {
+    meter.stop();
+    if (listener) { listener.track = null; if (listener.rec) try { listener.rec.abort(); } catch (e) {} }
+    store.set('lc_meter_bad', why);
+    if (G.checking) endCheck('');
+    renderMeter();
+  }
+  function renderMeter() {
+    const bad = store.get('lc_meter_bad', ''), on = G.joined && !!(listener && listener.want);
+    $('#gMeter').hidden = !(meter.ok && on);
+    const note = $('#gMeterNote');
+    note.hidden = !(bad && G.joined && SR);
+    note.textContent = 'This phone can’t measure how loud voices are while it listens, so other people’s voices are filtered less well here.';
+    $('#gRecheck').hidden = !(G.joined && SR && on && !G.checking);
+    $('#gRecheck').textContent = bad ? 'Try the voice check again' : 'Redo voice check';
+  }
+  const pct = db => Math.max(0, Math.min(100, (db + 75) / 70 * 100)) + '%';
+  setInterval(() => {
+    if (!meter.ok || $('#gMeter').hidden) return;
+    $('#gMeter i').style.width = pct(meter.last);
+    const b = $('#gMeter b'); b.hidden = !G.voice; if (G.voice) b.style.left = pct(G.voice.db);
+  }, 100);
+  // safety check: some phones can't measure loudness and turn speech into text at the same time.
+  // If the meter only gets silence, or speech keeps coming in but no words come back, turn it off.
+  setInterval(() => {
+    if (!meter.ok || !listener || !listener.want || document.visibilityState !== 'visible') return;
+    const now = Date.now(), f = meter.frames.filter(x => now - x[0] < 10000);
+    if (now - meter.startedAt < 6000 || f.length < 60) return;
+    const last3 = f.filter(x => now - x[0] < 3000);
+    if (last3.length > 20 && last3.every(x => x[1] < -100)) return meterFail('silent');
+    const sorted = f.map(x => x[1]).sort((a, b) => a - b), floor = sorted[Math.floor(sorted.length * 0.1)];
+    const loudSecs = f.filter(x => x[1] > floor + 25).length * 0.05;
+    if (loudSecs > 4 && now - G.lastSR > 15000 && now - meter.startedAt > 15000) meterFail('no-words');
+  }, 1000);
+
   const listener = SR ? new Listener({
     lang: G.lang,
-    onPartial: (u, t) => { sendPartial(u, t); $('#gLive').textContent = t; if (hint.classList.contains('bad')) renderMic(); },
-    onFinal: (u, t, cf) => { sendFinal('final', u, t, cf); pushHist(t, u); $('#gLive').textContent = ''; },
+    onPartial: (u, t) => {
+      G.lastSR = Date.now(); noteStart(u);
+      if (!G.checking) sendPartial(u, t);
+      $('#gLive').textContent = t; if (hint.classList.contains('bad')) renderMic();
+    },
+    onFinal: (u, t, cf) => {
+      G.lastSR = Date.now();
+      const db = levelFor(u); G.uStart.delete(u);
+      $('#gLive').textContent = '';
+      if (G.checking) { feedCheck(t, db); return; } // the voice check sentence isn't sent
+      sendFinal('final', u, t, cf, relTo(db)); learn(db);
+      pushHist(t, u);
+    },
     onState: () => renderMic(),
     onError: e => {
       if (e === 'blocked') setHint('The microphone is blocked. Allow it for this site in your browser settings, then tap the mic.', true);
@@ -906,6 +1084,7 @@ function startGuest() {
     $('#gMic').setAttribute('aria-pressed', String(on));
     setHint(on ? 'Listening — speak normally. Keep this screen open. Tap to pause.' : 'Paused. Tap the microphone to talk.');
     keepAwake(on);
+    renderMeter();
   }
   function pushHist(t, u) {
     if (!t) return;
@@ -943,7 +1122,7 @@ function startGuest() {
      wait in an outbox until the captions screen confirms them, and are resent until it does */
   function raw(m) { m.c = cid; return G.relay.publish(hostTopic, m); }
   function sendPartial(u, text) {
-    G.pending = { t: 'partial', u, text, s: ++G.seq };
+    G.pending = { t: 'partial', u, text, s: ++G.seq, lv: relTo(levelFor(u)) };
     const wait = 200 - (Date.now() - G.partialAt);
     if (wait > 0) { if (!G.partialTimer) G.partialTimer = setTimeout(flushPartial, wait); return; }
     flushPartial();
@@ -952,10 +1131,12 @@ function startGuest() {
     G.partialTimer = 0; const m = G.pending; if (!m) return;
     G.pending = null; G.partialAt = Date.now(); raw(m);
   }
-  function sendFinal(t, u, text, cf) {
+  function sendFinal(t, u, text, cf, lv) {
     if (!text) return;
     if (G.pending && G.pending.u === u) G.pending = null;
-    G.outbox.set(u, { m: { t, u, text, cf: +(cf || 0).toFixed(3), eg: ENGINE }, at: 0 });
+    const m = { t, u, text, cf: +(cf || 0).toFixed(3), eg: ENGINE };
+    if (typeof lv === 'number') m.lv = lv; // dB compared with the owner's own voice: 0 = as loud as them
+    G.outbox.set(u, { m, at: 0 });
     while (G.outbox.size > 100) G.outbox.delete(G.outbox.keys().next().value);
     flushOutbox();
   }
@@ -989,6 +1170,7 @@ function startGuest() {
       G.joined = false; G.rejoin = true; G.hue = null;
       G.outbox.clear(); G.pending = null; G.hist = []; renderHist();
       if (listener) listener.stop();
+      meter.stop(); G.checking = null; $('#gCheck').hidden = true;
       $('#gLive').textContent = '';
       G.host = clip(m.host, 30) || G.host;
       const n = $('#gWarn'); n.textContent = (G.host || 'The captions screen') + ' disconnected you from this room. If that was a mistake, tap Join again.';
@@ -1029,7 +1211,7 @@ function startGuest() {
     if (!G.joined) {
       $('#gWarn').hidden = !warns.length; if (warns.length) $('#gWarn').textContent = warns.join(' ');
       G.joined = true; setG(); tick();
-      if (listener) listener.start(); // inside the tap, so the browser can ask for the mic
+      if (listener) { listener.start(); startMeter('join'); } // inside the tap, so the browser can ask for the mic
       else setHint('Type below — your messages appear on their screen.');
     } else {
       raw({ t: 'hello', n: G.name });
@@ -1039,7 +1221,18 @@ function startGuest() {
   $('#gJoinBtn').onclick = join;
   $('#gName').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); join(); } });
   $('#gMe').onclick = () => { $('#gJoinBtn').textContent = 'Save'; $('#gJoin').hidden = false; $('#gMain').hidden = true; };
-  $('#gMic').onclick = () => { if (!listener) return; if (listener.want) listener.stop(); else listener.start(); };
+  $('#gMic').onclick = () => {
+    if (!listener) return;
+    if (listener.want) { listener.stop(); meter.stop(); listener.track = null; if (G.checking) endCheck(''); renderMeter(); } // paused: the mic is fully off
+    else { listener.start(); startMeter('resume'); }
+  };
+  $('#gSkip').onclick = () => endCheck('');
+  $('#gRecheck').onclick = () => {
+    if (!listener) return;
+    if (!listener.want) listener.start();
+    if (meter.ok) startCheck(); else startMeter('force');
+    renderMeter();
+  };
   $('#gTypeForm').onsubmit = e => {
     e.preventDefault();
     const i = $('#gType'), t = clip(i.value, 1000); if (!t) return;
