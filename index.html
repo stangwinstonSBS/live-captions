@@ -29,6 +29,8 @@ button.chip{font:inherit;cursor:pointer;min-height:36px}
 .huepop .lbl{grid-column:1/-1;font-weight:700}
 .swatch{--h:205;width:44px;height:44px;border-radius:50%;border:3px solid var(--panel);outline:2px solid transparent;background:hsl(var(--h),75%,52%);cursor:pointer}
 .swatch.sel{outline-color:var(--fg)}
+.huepop .kick{grid-column:1/-1;margin-top:4px;min-height:44px;border-radius:10px;border:1px solid var(--line);background:transparent;color:var(--bad);font:inherit;font-weight:700;cursor:pointer}
+.huepop .kick.armed{background:var(--bad);border-color:var(--bad);color:var(--panel)}
 .swatch:focus-visible{outline-color:var(--accent)}
 .chip.talking .dot{animation:pulse .9s infinite}
 @keyframes pulse{50%{transform:scale(1.7);opacity:.55}}
@@ -211,7 +213,7 @@ const joinId = (params.get('join') || '').trim();
 const PREFIX = 'lc-';
 const HUES = [205, 30, 130, 330, 55, 270, 175, 0, 95, 240];
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-const APP_V = 5; // bump on every update: phones on an older version reload themselves
+const APP_V = 6; // bump on every update: phones on an older version reload themselves
 // whose speech engine this browser uses: Apple's (every iPhone/iPad browser, Mac Safari) or Google's.
 // Their confidence scores run on different scales, so they're only compared like-for-like.
 const ENGINE = (/iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) ||
@@ -586,12 +588,37 @@ function startHost() {
       b.onclick = e => { e.stopPropagation(); setHue(k, h); huePop.hidden = true; };
       huePop.append(b);
     }
+    if (k !== 'room') {
+      const x = document.createElement('button'); x.type = 'button'; x.className = 'kick'; x.textContent = 'Disconnect ' + sp.name;
+      let t = 0;
+      x.onclick = e => {
+        e.stopPropagation();
+        if (!x.classList.contains('armed')) {
+          x.classList.add('armed'); x.textContent = 'Tap again to disconnect';
+          t = setTimeout(() => { x.classList.remove('armed'); x.textContent = 'Disconnect ' + sp.name; }, 4000);
+          return;
+        }
+        clearTimeout(t); huePop.hidden = true; kick(k);
+      };
+      huePop.append(x);
+    }
     const bar = $('.bar').getBoundingClientRect(), r = chip.getBoundingClientRect();
     huePop.hidden = false;
     const w = huePop.offsetWidth;
     huePop.style.left = Math.max(8, Math.min(r.left - bar.left, bar.width - w - 8)) + 'px';
   }
   document.addEventListener('click', e => { if (!huePop.hidden && !huePop.contains(e.target)) huePop.hidden = true; });
+  /* disconnect a phone: it stops listening and shows a "Join again" button. Until that person
+     taps it, anything their phone sends is ignored and answered with another "disconnect". */
+  H.kicked = new Map(); // phone id -> when we last told it
+  function kick(k) {
+    const sp = H.speakers.get(k); if (!sp) return;
+    for (const L of [...H.live.values()]) if (L.k === k) { H.done.add(L.k + '|' + L.u); liveText(L.k, L.name, L.hue, L.u, L.span.textContent.trim(), true); }
+    H.kicked.set(k, Date.now());
+    hostSend(k, { t: 'kick', host: H.hostName });
+    H.speakers.delete(k);
+    renderChips();
+  }
   function setHue(k, h) {
     const sp = H.speakers.get(k); if (!sp || sp.hue === h) return;
     sp.hue = h;
@@ -773,6 +800,13 @@ function startHost() {
     if (topic !== TOPIC + roomId + '/h' || !m || typeof m !== 'object') return;
     const cid = clip(m.c, 40); if (!/^c[a-z0-9]{8,20}$/.test(cid)) return;
     const now = Date.now();
+    if (H.kicked.has(cid)) {
+      if (m.t === 'hello' && m.r) H.kicked.delete(cid); // they tapped "Join again"
+      else {
+        if (m.t !== 'bye' && now - H.kicked.get(cid) > 3000) { H.kicked.set(cid, now); hostSend(cid, { t: 'kick', host: H.hostName }); }
+        return;
+      }
+    }
     let sp = H.speakers.get(cid);
     if (m.t === 'ping' || m.t === 'hello') {
       const name = clip(m.n, 30) || 'Guest';
@@ -949,7 +983,19 @@ function startGuest() {
       for (const x of G.hist) if (x.u === m.u) x.ok = true;
       renderHist();
     }
-    else if (m.t === 'welcome') { G.hue = HUES.includes(m.hue) ? m.hue : null; G.host = clip(m.host, 30); renderMe(); setG(); }
+    else if (m.t === 'welcome') { G.rejoin = false; G.hue = HUES.includes(m.hue) ? m.hue : null; G.host = clip(m.host, 30); renderMe(); setG(); }
+    else if (m.t === 'kick') {
+      if (!G.joined) return;
+      G.joined = false; G.rejoin = true; G.hue = null;
+      G.outbox.clear(); G.pending = null; G.hist = []; renderHist();
+      if (listener) listener.stop();
+      $('#gLive').textContent = '';
+      G.host = clip(m.host, 30) || G.host;
+      const n = $('#gWarn'); n.textContent = (G.host || 'The captions screen') + ' disconnected you from this room. If that was a mistake, tap Join again.';
+      n.hidden = false; $('#gJoinBtn').textContent = 'Join again';
+      $('#gMain').hidden = true; $('#gJoin').hidden = false;
+      keepAwake(false); setG();
+    }
     else if (m.t === 'host') { G.host = clip(m.name, 30); setG(); }
     else if (m.t === 'reply') {
       G.host = clip(m.from, 30) || G.host;
@@ -962,7 +1008,7 @@ function startGuest() {
   function tick() {
     if (!G.joined) return;
     // "hello" until the screen has told us our color, then a light "ping" (both carry our name)
-    raw(G.hue == null ? { t: 'hello', n: G.name } : { t: 'ping', n: G.name });
+    raw(G.hue == null ? (G.rejoin ? { t: 'hello', n: G.name, r: 1 } : { t: 'hello', n: G.name }) : { t: 'ping', n: G.name });
     if (linked()) flushOutbox();
     setG();
   }
@@ -981,6 +1027,7 @@ function startGuest() {
     G.name = name; G.lang = sel.value; store.set('lc_name', name); store.set('lc_lang', G.lang);
     $('#gJoin').hidden = true; $('#gMain').hidden = false; renderMe();
     if (!G.joined) {
+      $('#gWarn').hidden = !warns.length; if (warns.length) $('#gWarn').textContent = warns.join(' ');
       G.joined = true; setG(); tick();
       if (listener) listener.start(); // inside the tap, so the browser can ask for the mic
       else setHint('Type below — your messages appear on their screen.');
