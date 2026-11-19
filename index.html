@@ -6,7 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <title>Live Captions</title>
-<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
 <style>
 :root{--bg:#f5f6f8;--panel:#fff;--fg:#14171c;--muted:#5b6470;--line:#d9dee4;--accent:#1f6feb;--accent-fg:#fff;--ok:#1a8f3c;--warn:#b25b00;--bad:#c62828;--nameL:33%;--textL:20%;--tint:.09;--fs:30px;color-scheme:light}
@@ -24,6 +24,12 @@ button,input,select{font:inherit;color:inherit}
 .dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.bad{background:var(--bad)}
 .chip{--h:205;display:inline-flex;align-items:center;gap:6px;padding:4px 11px;border-radius:999px;background:hsla(var(--h),70%,50%,var(--tint));border:1px solid hsla(var(--h),70%,50%,.55);color:hsl(var(--h),75%,var(--nameL));font-weight:600;white-space:nowrap}
 .chip .dot{background:hsl(var(--h),75%,52%)}
+button.chip{font:inherit;cursor:pointer;min-height:36px}
+.huepop{position:absolute;top:100%;margin-top:4px;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px;box-shadow:0 10px 30px rgba(0,0,0,.25);display:grid;grid-template-columns:repeat(5,44px);gap:10px;z-index:30}
+.huepop .lbl{grid-column:1/-1;font-weight:700}
+.swatch{--h:205;width:44px;height:44px;border-radius:50%;border:3px solid var(--panel);outline:2px solid transparent;background:hsl(var(--h),75%,52%);cursor:pointer}
+.swatch.sel{outline-color:var(--fg)}
+.swatch:focus-visible{outline-color:var(--accent)}
 .chip.talking .dot{animation:pulse .9s infinite}
 @keyframes pulse{50%{transform:scale(1.7);opacity:.55}}
 
@@ -90,6 +96,8 @@ h1{font-size:1.5em;margin:0 0 .3em}
 .hint.bad{color:var(--bad);font-weight:600}
 .heard{min-height:5em}
 .heard .old{color:var(--muted);font-size:17px;margin:2px 0}
+.tick{font-weight:700;color:var(--warn)}.tick.ok{color:var(--ok)}
+.legend{color:var(--muted);font-size:12px;margin-top:6px}
 .livebig{color:hsl(var(--h),50%,var(--textL));font-size:24px;min-height:1.4em;font-style:italic}
 .replycard{border-radius:16px;padding:12px 16px;background:var(--accent);color:var(--accent-fg);font-size:24px;line-height:1.3}
 .replycard .from{font-size:13px;opacity:.85;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
@@ -119,6 +127,7 @@ h1{font-size:1.5em;margin:0 0 .3em}
       <button id="bClear">Clear transcript</button>
       <button id="bTheme">Light / dark</button>
     </div>
+    <div id="huePop" class="huepop" role="dialog" aria-label="Choose a color" hidden></div>
   </header>
   <div class="feedwrap">
     <main id="feed" class="feed" aria-live="polite">
@@ -172,7 +181,7 @@ h1{font-size:1.5em;margin:0 0 .3em}
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><path d="M12 17v4"/><path d="M8 21h8"/></svg>
     </button>
     <p id="gHint" class="hint"></p>
-    <div class="heard"><div id="gHist"></div><div id="gLive" class="livebig"></div></div>
+    <div class="heard"><div id="gHist"></div><div id="gLive" class="livebig"></div><div id="gLegend" class="legend" hidden>✓ = on their screen · … = still sending</div></div>
     <form id="gTypeForm" class="typeform"><input id="gType" placeholder="Or type a message…" autocomplete="off" enterkeyhint="send" maxlength="1000"><button class="btn">Send</button></form>
   </section>
 </div>
@@ -261,6 +270,60 @@ class Listener {
   }
 }
 
+/* Connections: messages travel through public MQTT relays over secure websockets, which work on
+   Wi-Fi, mobile data and VPNs alike. Two relays are used at once, so one being down doesn't matter.
+   Every message is end-to-end encrypted with the room's key, which exists only in the QR code link
+   (after the #, so it is never sent to any server) — the relays only ever see scrambled bytes. */
+const RELAYS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
+const TOPIC = 'live-captions-v1/';
+const joinKey = (location.hash.match(/k=([A-Za-z0-9_-]{16,})/) || [])[1] || '';
+const b64u = {
+  enc: u8 => btoa(String.fromCharCode(...u8)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''),
+  dec: s => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0))
+};
+const newKey = () => b64u.enc(crypto.getRandomValues(new Uint8Array(16)));
+const importKey = k => crypto.subtle.importKey('raw', b64u.dec(k), 'AES-GCM', false, ['encrypt', 'decrypt']);
+async function seal(key, obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(JSON.stringify(obj))));
+  const out = new Uint8Array(12 + ct.length); out.set(iv); out.set(ct, 12); return out;
+}
+async function unseal(key, buf) {
+  try {
+    const u8 = new Uint8Array(buf);
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: u8.slice(0, 12) }, key, u8.slice(12));
+    return JSON.parse(new TextDecoder().decode(pt));
+  } catch (e) { return null; } // not ours, or tampered with
+}
+class Relay {
+  constructor(onMessage) { this.onMessage = onMessage; this.clients = []; this.subs = []; this.key = null; this.chain = Promise.resolve(); }
+  start() {
+    for (const url of RELAYS) {
+      let c;
+      try { c = mqtt.connect(url, { clean: true, connectTimeout: 8000, reconnectPeriod: 3000, keepalive: 20, clientId: 'lc_' + rid(12) }); } catch (e) { continue; }
+      c.on('connect', () => { if (this.subs.length) c.subscribe(this.subs, { qos: 0 }); });
+      c.on('message', (topic, payload) => {
+        const key = this.key; if (!key) return;
+        unseal(key, payload).then(m => { if (m && key === this.key) this.onMessage(topic, m); });
+      });
+      c.on('error', () => {});
+      this.clients.push(c);
+    }
+  }
+  get up() { return this.clients.some(c => c.connected); }
+  setSubs(subs) {
+    for (const c of this.clients) if (c.connected) { if (this.subs.length) c.unsubscribe(this.subs); if (subs.length) c.subscribe(subs, { qos: 0 }); }
+    this.subs = subs;
+  }
+  publish(topic, obj) {
+    const key = this.key; if (!key || !this.up) return false;
+    this.chain = this.chain.then(() => seal(key, obj))
+      .then(bytes => { for (const c of this.clients) if (c.connected) c.publish(topic, bytes, { qos: 0 }); })
+      .catch(() => {});
+    return true;
+  }
+}
+
 /* ======================= HOST (the deaf user's screen) ======================= */
 function startHost() {
   mount('tpl-host');
@@ -276,14 +339,17 @@ function startHost() {
     store.set('lc_rooms', rooms);
     try { localStorage.removeItem('lc_log'); } catch (e) {}
   }
-  rooms = rooms.filter(r => r && validId(r.id)).map(r => ({ id: r.id, name: clip(r.name, 40) || 'Room' }));
-  if (!rooms.length) rooms = [{ id: PREFIX + rid(10), name: 'Room 1' }];
+  const validKey = k => typeof k === 'string' && /^[A-Za-z0-9_-]{22}$/.test(k);
+  rooms = rooms.filter(r => r && validId(r.id)).map(r => ({ id: r.id, name: clip(r.name, 40) || 'Room', key: validKey(r.key) ? r.key : newKey() }));
+  if (!rooms.length) rooms = [{ id: PREFIX + rid(10), name: 'Room 1', key: newKey() }];
   let roomId = store.get('lc_room', '');
   if (!rooms.some(r => r.id === roomId)) roomId = rooms[0].id;
   store.set('lc_room', roomId);
   const saveRooms = () => store.set('lc_rooms', rooms);
-  const roomName = () => (rooms.find(r => r.id === roomId) || {}).name || 'Room';
-  const H = { peer: null, idFails: 0, conns: new Map(), speakers: new Map(), live: new Map(), log: [], lastTurn: null, hostName: store.get('lc_hostname', ''), roomMic: null };
+  saveRooms();
+  const room = () => rooms.find(r => r.id === roomId) || rooms[0];
+  const roomName = () => room().name;
+  const H = { relay: null, speakers: new Map(), live: new Map(), done: new Set(), seq: new Map(), log: [], lastTurn: null, hostName: store.get('lc_hostname', ''), roomMic: null };
 
   /* text size */
   let fs = store.get('lc_fs', 30);
@@ -316,6 +382,7 @@ function startHost() {
     const L = H.lastTurn;
     if (L && L.k === k && ts - L.at < 90000 && L.el.isConnected) { L.at = ts; return L; }
     const el = document.createElement('div'); el.className = 'turn' + (k === 'me' ? ' me' : '');
+    el.dataset.k = k;
     if (hue != null) el.style.setProperty('--h', hue);
     const who = document.createElement('div'); who.className = 'who';
     const nm = document.createElement('span'); nm.textContent = name;
@@ -349,6 +416,7 @@ function startHost() {
       turn.said.append(span);
       L = { k, name, hue, u, span, turn }; H.live.set(key, L);
     }
+    L.at = Date.now();
     if (final) {
       H.live.delete(key);
       if (!text) {
@@ -379,25 +447,56 @@ function startHost() {
     chips.textContent = '';
     for (const [k, sp] of H.speakers) {
       if (!sp.conns.size) continue;
-      const c = document.createElement('span'); c.className = 'chip' + (isTalking(k) ? ' talking' : '');
-      c.style.setProperty('--h', sp.hue);
+      const c = document.createElement('button'); c.type = 'button'; c.className = 'chip' + (isTalking(k) ? ' talking' : '');
+      c.style.setProperty('--h', sp.hue); c.title = 'Change ' + sp.name + '’s color';
       const d = document.createElement('span'); d.className = 'dot';
       const n = document.createElement('span'); n.textContent = sp.name;
       c.append(d, n); chips.append(c);
+      c.onclick = e => { e.stopPropagation(); openHuePicker(k, c); };
     }
     const g = guestCount();
     $('#inviteCount').textContent = g ? (g === 1 ? '1 person connected' : g + ' people connected') : 'Nobody connected yet';
     setStatus();
   }
   function setStatus() {
-    const p = H.peer; let cls = 'warn', txt = 'Connecting…';
-    if (p && p.open && !p.disconnected) { cls = 'ok'; const g = guestCount(); txt = g ? g + ' connected' : 'Ready'; }
-    else if (p && p.disconnected) txt = 'Reconnecting…';
+    let cls = 'warn', txt = 'Connecting…';
+    if (H.relay && H.relay.up) { cls = 'ok'; const g = guestCount(); txt = g ? g + ' connected' : 'Ready'; }
     $('#dot').className = 'dot ' + cls; $('#status').textContent = txt;
   }
 
+  /* tap a name tag to pick that person's color */
+  const huePop = $('#huePop');
+  function openHuePicker(k, chip) {
+    const sp = H.speakers.get(k); if (!sp) return;
+    if (!huePop.hidden && huePop.dataset.k === k) { huePop.hidden = true; return; }
+    huePop.dataset.k = k; huePop.textContent = '';
+    const lbl = document.createElement('div'); lbl.className = 'lbl'; lbl.textContent = 'Color for ' + sp.name; huePop.append(lbl);
+    for (const h of HUES) {
+      const b = document.createElement('button'); b.type = 'button'; b.className = 'swatch' + (h === sp.hue ? ' sel' : '');
+      b.style.setProperty('--h', h); b.setAttribute('aria-label', 'Color ' + (HUES.indexOf(h) + 1));
+      b.onclick = e => { e.stopPropagation(); setHue(k, h); huePop.hidden = true; };
+      huePop.append(b);
+    }
+    const bar = $('.bar').getBoundingClientRect(), r = chip.getBoundingClientRect();
+    huePop.hidden = false;
+    const w = huePop.offsetWidth;
+    huePop.style.left = Math.max(8, Math.min(r.left - bar.left, bar.width - w - 8)) + 'px';
+  }
+  document.addEventListener('click', e => { if (!huePop.hidden && !huePop.contains(e.target)) huePop.hidden = true; });
+  function setHue(k, h) {
+    const sp = H.speakers.get(k); if (!sp || sp.hue === h) return;
+    sp.hue = h;
+    const map = store.get('lc_hues', {}); map[k] = h; store.set('lc_hues', map);
+    for (const el of feed.querySelectorAll('.turn')) if (el.dataset.k === k) el.style.setProperty('--h', h);
+    for (const e of H.log) if (e.k === k) e.h = h;
+    for (const L of H.live.values()) if (L.k === k) L.hue = h;
+    saveLog();
+    if (k !== 'room') hostSend(k, { t: 'welcome', hue: h, host: H.hostName });
+    renderChips();
+  }
+
   /* invite / QR */
-  function joinUrl() { return location.origin + location.pathname + '?join=' + encodeURIComponent(roomId); }
+  function joinUrl() { return location.origin + location.pathname + '?join=' + encodeURIComponent(roomId) + '#k=' + room().key; }
   function drawQR() {
     const url = joinUrl();
     const qr = qrcode(0, 'M'); qr.addData(url); qr.make();
@@ -416,7 +515,7 @@ function startHost() {
   const hn = $('#hostName'); hn.value = H.hostName;
   hn.addEventListener('input', () => {
     H.hostName = clip(hn.value, 30); store.set('lc_hostname', H.hostName);
-    for (const { conn } of H.conns.values()) safeSend(conn, { t: 'host', name: H.hostName });
+    hostSend('all', { t: 'host', name: H.hostName });
   });
   drawQR();
 
@@ -427,12 +526,12 @@ function startHost() {
     if (id === roomId || !rooms.some(r => r.id === id)) return;
     flushLog();
     if (H.roomMic && H.roomMic.want) H.roomMic.stop();
-    for (const rec of [...H.conns.values()]) dropConn(rec.conn); // their phones wait and rejoin when this room is opened again
+    for (const sp of H.speakers.values()) sp.conns.delete('net'); // their phones wait and rejoin when this room is opened again
     feed.querySelectorAll('.turn').forEach(n => n.remove());
     H.live.clear(); H.lastTurn = null; H.log = [];
     $('#empty').hidden = false;
-    roomId = id; store.set('lc_room', roomId); H.idFails = 0;
-    loadLog(); drawQR(); renderRoomName(); hostConnect(); renderChips();
+    roomId = id; store.set('lc_room', roomId);
+    loadLog(); drawQR(); renderRoomName(); useRoom(); renderChips();
   }
   function renameRoom(r, input) {
     r.name = clip(input.value, 40) || r.name; saveRooms(); renderRoomName(); renderRooms();
@@ -478,7 +577,7 @@ function startHost() {
   $('#addRoom').onsubmit = e => {
     e.preventDefault();
     const inp = $('#newRoomName');
-    const r = { id: PREFIX + rid(10), name: clip(inp.value, 40) || 'Room ' + (rooms.length + 1) };
+    const r = { id: PREFIX + rid(10), name: clip(inp.value, 40) || 'Room ' + (rooms.length + 1), key: newKey() };
     rooms.push(r); saveRooms(); inp.value = '';
     openRoom(r.id); roomsSheet.hidden = true; invite.hidden = false; // a new room needs people to scan in
   };
@@ -532,10 +631,12 @@ function startHost() {
   };
 
   /* replies from the deaf user to everyone's phones */
-  function safeSend(conn, m) { if (conn && conn.open) try { conn.send(m); } catch (e) {} }
+  function hostSend(to, m) { // to: one phone's id, or 'all'
+    if (H.relay) H.relay.publish(TOPIC + roomId + (to === 'all' ? '/all' : '/g/' + to), m);
+  }
   function sendReply(text) {
     text = clip(text, 1000); if (!text) return;
-    for (const { conn } of H.conns.values()) safeSend(conn, { t: 'reply', text, from: H.hostName });
+    hostSend('all', { t: 'reply', text, from: H.hostName });
     addFinal('me', H.hostName ? H.hostName + ' (you)' : 'You', null, text);
     toBottom();
   }
@@ -546,75 +647,60 @@ function startHost() {
   }
   $('#replyForm').onsubmit = e => { e.preventDefault(); const i = $('#replyIn'); sendReply(i.value); i.value = ''; };
 
-  /* networking */
-  function dropConn(conn) {
-    const rec = H.conns.get(conn.peer); if (!rec || rec.conn !== conn) return;
-    H.conns.delete(conn.peer); try { conn.close(); } catch (e) {}
-    if (rec.cid) { const sp = H.speakers.get(rec.cid); if (sp) { sp.conns.delete(conn.peer); if (!sp.conns.size) finalizeLive(rec.cid); } }
-    renderChips();
-  }
-  function onData(conn, m) {
-    const rec = H.conns.get(conn.peer);
-    if (!rec || rec.conn !== conn || !m || typeof m !== 'object') return;
-    rec.seen = Date.now();
-    if (m.t === 'hello') {
-      const cid = clip(m.cid, 40) || conn.peer;
-      if (cid === 'me' || cid === 'room') return;
-      const name = clip(m.name, 30) || 'Guest';
-      if (rec.cid && rec.cid !== cid) return;
-      rec.cid = cid;
-      let sp = H.speakers.get(cid);
-      if (!sp) { sp = { name, hue: hueFor(cid), conns: new Set() }; H.speakers.set(cid, sp); }
-      sp.name = name; sp.conns.add(conn.peer);
-      safeSend(conn, { t: 'welcome', hue: sp.hue, host: H.hostName });
-      renderChips(); return;
-    }
-    if (!rec.cid) return;
-    const sp = H.speakers.get(rec.cid); if (!sp) return;
-    if (m.t === 'partial' || m.t === 'final') liveText(rec.cid, sp.name, sp.hue, clip(m.u, 24), clip(m.text, 4000), m.t === 'final');
-    else if (m.t === 'typed') { const t = clip(m.text, 4000); if (t) addFinal(rec.cid, sp.name, sp.hue, t); }
-    else if (m.t === 'bye') dropConn(conn);
-  }
-  function hostConnect() {
-    if (H.peer && !H.peer.destroyed) try { H.peer.destroy(); } catch (e) {}
-    const peer = new Peer(roomId, { debug: 0 });
-    H.peer = peer; setStatus();
-    peer.on('open', () => { H.idFails = 0; setStatus(); });
-    peer.on('disconnected', setStatus);
-    peer.on('close', setStatus);
-    peer.on('connection', conn => {
-      H.conns.set(conn.peer, { conn, cid: null, seen: Date.now() });
-      conn.on('data', d => onData(conn, d));
-      conn.on('close', () => dropConn(conn));
-      conn.on('error', () => dropConn(conn));
-    });
-    peer.on('error', err => {
-      if (err.type === 'unavailable-id' || err.type === 'invalid-id') {
-        // the id may still be held for a few seconds after a reload; after a few tries, pick a new one
-        try { peer.destroy(); } catch (e) {}
-        if (++H.idFails >= 3 || err.type === 'invalid-id') {
-          flushLog();
-          const r = rooms.find(x => x.id === roomId), newId = PREFIX + rid(10);
-          store.set('lc_log_' + newId, H.log);
-          try { localStorage.removeItem('lc_log_' + roomId); } catch (e) {}
-          if (r) r.id = newId;
-          roomId = newId; store.set('lc_room', roomId); saveRooms(); H.idFails = 0; drawQR();
-        }
-      } else if (err.type === 'browser-incompatible') {
-        fatal('This browser can’t make live connections. Please use Safari, Chrome or Edge.');
-      }
-      setStatus();
-    });
-  }
-  setInterval(() => {
-    const p = H.peer;
-    if (!p || p.destroyed) hostConnect();
-    else if (p.disconnected) try { p.reconnect(); } catch (e) {}
+  /* networking: phones write to <room>/h; the screen answers each phone on <room>/g/<phone id>
+     and everyone on <room>/all. Phones ping every 2 s; a phone silent for 15 s is shown as gone. */
+  function onMsg(topic, m) {
+    if (topic !== TOPIC + roomId + '/h' || !m || typeof m !== 'object') return;
+    const cid = clip(m.c, 40); if (!/^c[a-z0-9]{8,20}$/.test(cid)) return;
     const now = Date.now();
-    for (const rec of [...H.conns.values()]) if (now - rec.seen > 25000) dropConn(rec.conn);
+    let sp = H.speakers.get(cid);
+    if (m.t === 'ping' || m.t === 'hello') {
+      const name = clip(m.n, 30) || 'Guest';
+      const fresh = !sp || !sp.conns.has('net');
+      if (!sp) { sp = { name, hue: hueFor(cid), conns: new Set() }; H.speakers.set(cid, sp); }
+      const changed = fresh || sp.name !== name;
+      sp.name = name; sp.seen = now; sp.conns.add('net');
+      hostSend(cid, fresh || m.t === 'hello' ? { t: 'welcome', hue: sp.hue, host: H.hostName } : { t: 'pong' });
+      if (changed) renderChips();
+      return;
+    }
+    if (!sp) return;
+    sp.seen = now;
+    if (!sp.conns.has('net')) { sp.conns.add('net'); renderChips(); }
+    const u = clip(m.u, 24), key = cid + '|' + u;
+    if (m.t === 'partial') {
+      if (H.done.has(key)) return;
+      const s = +m.s || 0; if (s < (H.seq.get(key) || 0)) return; // an older guess arriving late
+      H.seq.set(key, s);
+      liveText(cid, sp.name, sp.hue, u, clip(m.text, 4000), false);
+    } else if (m.t === 'final' || m.t === 'typed') {
+      if (!u) return;
+      hostSend(cid, { t: 'ack', u });   // receipt, so the phone stops resending
+      if (H.done.has(key)) return;      // a resend (or the copy from the second relay) we already have
+      H.done.add(key); H.seq.delete(key); if (H.done.size > 5000) H.done.clear();
+      const t = clip(m.text, 4000);
+      if (m.t === 'final') liveText(cid, sp.name, sp.hue, u, t, true);
+      else if (t) addFinal(cid, sp.name, sp.hue, t);
+    } else if (m.t === 'bye') { sp.conns.delete('net'); renderChips(); }
+  }
+  function useRoom() {
+    const id = roomId;
+    H.relay.key = null;
+    H.relay.setSubs([TOPIC + id + '/h']);
+    importKey(room().key).then(k => { if (roomId === id) H.relay.key = k; });
+  }
+  H.relay = new Relay(onMsg);
+  H.relay.start();
+  useRoom();
+  setInterval(() => {
+    const now = Date.now();
+    for (const sp of H.speakers.values()) if (sp.conns.has('net') && now - (sp.seen || 0) > 15000) { sp.conns.delete('net'); renderChips(); }
+    // live text whose finished sentence never arrived: keep what we have
+    for (const L of [...H.live.values()]) if (L.k !== 'room' && now - L.at > 45000) {
+      H.done.add(L.k + '|' + L.u); liveText(L.k, L.name, L.hue, L.u, L.span.textContent.trim(), true);
+    }
     setStatus();
-  }, 4000);
-  hostConnect();
+  }, 2000);
   renderChips();
   keepAwake(true);
   document.addEventListener('click', () => keepAwake(true), { once: true });
@@ -625,7 +711,7 @@ function startGuest() {
   mount('tpl-guest');
   let cid = store.get('lc_cid', '');
   if (!/^c[a-z0-9]{8,20}$/.test(cid)) { cid = 'c' + rid(12); store.set('lc_cid', cid); }
-  const G = { name: store.get('lc_name', ''), lang: store.get('lc_lang', ''), peer: null, conn: null, connAt: 0, waiting: false, joined: false, queue: [], hist: [], host: '' };
+  const G = { name: store.get('lc_name', ''), lang: store.get('lc_lang', ''), relay: null, lastHeard: 0, everLinked: false, downSince: 0, seq: 0, hue: null, joined: false, outbox: new Map(), pending: null, partialAt: 0, partialTimer: 0, hist: [], host: '' };
   if (!G.lang) { const nl = navigator.language || 'en-US'; G.lang = (LANGS.find(l => l[0] === nl) || LANGS.find(l => l[0].slice(0, 2) === nl.slice(0, 2)) || LANGS[0])[0]; }
   const wrap = $('.gwrap');
   const sel = $('#gLang');
@@ -643,8 +729,8 @@ function startGuest() {
   function setHint(t, bad) { hint.textContent = t; hint.className = 'hint' + (bad ? ' bad' : ''); }
   const listener = SR ? new Listener({
     lang: G.lang,
-    onPartial: (u, t) => { send({ t: 'partial', u, text: t }); $('#gLive').textContent = t; if (hint.classList.contains('bad')) renderMic(); },
-    onFinal: (u, t) => { send({ t: 'final', u, text: t }); pushHist(t); $('#gLive').textContent = ''; },
+    onPartial: (u, t) => { sendPartial(u, t); $('#gLive').textContent = t; if (hint.classList.contains('bad')) renderMic(); },
+    onFinal: (u, t) => { sendFinal('final', u, t); pushHist(t, u); $('#gLive').textContent = ''; },
     onState: () => renderMic(),
     onError: e => {
       if (e === 'blocked') setHint('The microphone is blocked. Allow it for this site in your browser settings, then tap the mic.', true);
@@ -660,29 +746,73 @@ function startGuest() {
     setHint(on ? 'Listening — speak normally. Keep this screen open. Tap to pause.' : 'Paused. Tap the microphone to talk.');
     keepAwake(on);
   }
-  function pushHist(t) {
-    G.hist.push(t); if (G.hist.length > 3) G.hist.shift();
+  function pushHist(t, u) {
+    if (!t) return;
+    G.hist.push({ t, u, ok: false }); if (G.hist.length > 3) G.hist.shift();
+    renderHist();
+  }
+  function renderHist() {
     const h = $('#gHist'); h.textContent = '';
-    for (const x of G.hist) { const d = document.createElement('div'); d.className = 'old'; d.textContent = x; h.append(d); }
+    for (const x of G.hist) {
+      const d = document.createElement('div'); d.className = 'old'; d.textContent = x.t + ' ';
+      const s = document.createElement('span'); s.className = x.ok ? 'tick ok' : 'tick';
+      s.textContent = x.ok ? '✓' : '…'; s.title = x.ok ? 'On their screen' : 'Sending…';
+      d.append(s); h.append(d);
+    }
+    $('#gLegend').hidden = !G.hist.length;
   }
   function renderMe() {
     const me = $('#gMe'); me.textContent = G.name + ' ✎';
     wrap.style.setProperty('--h', G.hue == null ? 205 : G.hue);
     me.style.setProperty('--h', G.hue == null ? 205 : G.hue);
   }
+  /* connection state: "linked" means the captions screen itself answered in the last 9 seconds */
+  const hostTopic = TOPIC + joinId + '/h';
+  const linked = () => Date.now() - G.lastHeard < 9000;
   function setG() {
     let cls = 'warn', txt = 'Connecting…';
-    if (G.conn && G.conn.open) { cls = 'ok'; txt = 'Connected — your words appear on ' + (G.host ? G.host + '’s' : 'their') + ' screen'; }
-    else if (G.waiting) txt = 'Waiting for this room to open on the captions screen… You’ll reconnect by yourself.';
+    const up = G.relay && G.relay.up;
+    if (up || !G.joined) G.downSince = 0; else if (!G.downSince) G.downSince = Date.now();
+    if (linked()) { cls = 'ok'; txt = 'Connected — your words appear on ' + (G.host ? G.host + '’s' : 'their') + ' screen'; }
+    else if (up) txt = G.everLinked ? 'Lost the captions screen — reconnecting by itself…' : 'Waiting for the captions screen to answer… (it must be open on this room)';
+    else if (G.downSince && Date.now() - G.downSince > 15000) { cls = 'bad'; txt = 'Can’t reach the internet from this phone. Check Wi-Fi or mobile data. Still trying…'; }
     $('#gDot').className = 'dot ' + cls; $('#gStatus').textContent = txt;
   }
-  function send(m) {
-    if (G.conn && G.conn.open) { try { G.conn.send(m); return; } catch (e) {} }
-    if ((m.t === 'final' || m.t === 'typed') && m.text) { G.queue.push(m); if (G.queue.length > 50) G.queue.shift(); }
+  /* sending: live text is best-effort (and limited to 5 per second); finished sentences
+     wait in an outbox until the captions screen confirms them, and are resent until it does */
+  function raw(m) { m.c = cid; return G.relay.publish(hostTopic, m); }
+  function sendPartial(u, text) {
+    G.pending = { t: 'partial', u, text, s: ++G.seq };
+    const wait = 200 - (Date.now() - G.partialAt);
+    if (wait > 0) { if (!G.partialTimer) G.partialTimer = setTimeout(flushPartial, wait); return; }
+    flushPartial();
   }
-  function onMsg(m) {
+  function flushPartial() {
+    G.partialTimer = 0; const m = G.pending; if (!m) return;
+    G.pending = null; G.partialAt = Date.now(); raw(m);
+  }
+  function sendFinal(t, u, text) {
+    if (!text) return;
+    if (G.pending && G.pending.u === u) G.pending = null;
+    G.outbox.set(u, { m: { t, u, text }, at: 0 });
+    while (G.outbox.size > 100) G.outbox.delete(G.outbox.keys().next().value);
+    flushOutbox();
+  }
+  function flushOutbox(force) {
+    const now = Date.now();
+    for (const e of G.outbox.values()) if (force || now - e.at > 5000) { if (raw(e.m)) e.at = now; else break; }
+  }
+  function onMsg(topic, m) {
     if (!m || typeof m !== 'object') return;
-    if (m.t === 'welcome') { G.hue = HUES.includes(m.hue) ? m.hue : null; G.host = clip(m.host, 30); renderMe(); setG(); }
+    const was = linked();
+    G.lastHeard = Date.now(); G.everLinked = true;
+    if (!was) { flushOutbox(true); setG(); } // back in touch: send anything still waiting
+    if (m.t === 'ack') {
+      G.outbox.delete(m.u);
+      for (const x of G.hist) if (x.u === m.u) x.ok = true;
+      renderHist();
+    }
+    else if (m.t === 'welcome') { G.hue = HUES.includes(m.hue) ? m.hue : null; G.host = clip(m.host, 30); renderMe(); setG(); }
     else if (m.t === 'host') { G.host = clip(m.name, 30); setG(); }
     else if (m.t === 'reply') {
       G.host = clip(m.from, 30) || G.host;
@@ -692,38 +822,20 @@ function startGuest() {
       try { navigator.vibrate && navigator.vibrate([120, 60, 120]); } catch (e) {}
     }
   }
-  function ensurePeer() {
-    if (G.peer && !G.peer.destroyed) { if (G.peer.disconnected) try { G.peer.reconnect(); } catch (e) {} return G.peer.open; }
-    const p = new Peer({ debug: 0 }); G.peer = p;
-    p.on('open', () => tick());
-    p.on('error', err => {
-      if (err.type === 'peer-unavailable') { G.waiting = true; if (G.conn) { try { G.conn.close(); } catch (e) {} G.conn = null; } }
-      else if (err.type === 'browser-incompatible') fatal('This browser can’t make live connections. Please use Chrome or Safari.');
-      setG();
-    });
-    return false;
-  }
   function tick() {
     if (!G.joined) return;
-    if (G.conn && G.conn.open) { send({ t: 'ping' }); return; }
-    if (!ensurePeer()) { setG(); return; }
-    if (G.conn && Date.now() - G.connAt < 10000) return; // still trying
-    if (G.conn) try { G.conn.close(); } catch (e) {}
-    const c = G.peer.connect(joinId, { reliable: true });
-    G.conn = c; G.connAt = Date.now();
-    c.on('open', () => {
-      if (G.conn !== c) return;
-      G.waiting = false;
-      c.send({ t: 'hello', cid, name: G.name });
-      while (G.queue.length) c.send(G.queue.shift());
-      setG();
-    });
-    c.on('data', onMsg);
-    c.on('close', () => { if (G.conn === c) { G.conn = null; setG(); setTimeout(tick, 500); } });
-    c.on('error', () => { if (G.conn === c) { G.conn = null; setG(); } });
+    // "hello" until the screen has told us our color, then a light "ping" (both carry our name)
+    raw(G.hue == null ? { t: 'hello', n: G.name } : { t: 'ping', n: G.name });
+    if (linked()) flushOutbox();
+    setG();
   }
-  setInterval(tick, 3000);
-  addEventListener('pagehide', () => { if (G.conn && G.conn.open) try { G.conn.send({ t: 'bye' }); } catch (e) {} });
+  G.relay = new Relay(onMsg);
+  G.relay.setSubs([TOPIC + joinId + '/g/' + cid, TOPIC + joinId + '/all']);
+  G.relay.start();
+  importKey(joinKey).then(k => { G.relay.key = k; tick(); });
+  setInterval(tick, 2000);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') tick(); });
+  addEventListener('pagehide', () => { raw({ t: 'bye' }); });
 
   function join() {
     const name = clip($('#gName').value, 30);
@@ -736,7 +848,7 @@ function startGuest() {
       if (listener) listener.start(); // inside the tap, so the browser can ask for the mic
       else setHint('Type below — your messages appear on their screen.');
     } else {
-      send({ t: 'hello', cid, name: G.name });
+      raw({ t: 'hello', n: G.name });
       if (listener && langChanged) listener.setLang(G.lang);
     }
   }
@@ -747,12 +859,14 @@ function startGuest() {
   $('#gTypeForm').onsubmit = e => {
     e.preventDefault();
     const i = $('#gType'), t = clip(i.value, 1000); if (!t) return;
-    send({ t: 'typed', text: t }); pushHist('⌨ ' + t); i.value = '';
+    const u = 't' + rid(8);
+    sendFinal('typed', u, t); pushHist('⌨ ' + t, u); i.value = '';
   };
 }
 
 /* ======================= boot ======================= */
-if (typeof Peer === 'undefined' || typeof qrcode === 'undefined') fatal('Couldn’t load the connection tools. Check the internet connection and reload the page.');
+if (typeof mqtt === 'undefined' || typeof qrcode === 'undefined' || !window.crypto || !crypto.subtle) fatal('Couldn’t load the connection tools. Check the internet connection and reload the page (it must be opened from its https:// web address).');
+else if (joinId && !joinKey) fatal('This link is missing part of its code. Scan the QR code on the captions screen again.');
 else if (joinId) startGuest();
 else startHost();
 </script>
