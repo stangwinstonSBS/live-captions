@@ -54,6 +54,12 @@ button.chip{font:inherit;cursor:pointer;min-height:36px}
 .menu{position:absolute;right:12px;top:100%;margin-top:4px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:6px;display:flex;flex-direction:column;min-width:240px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
 .menu button{background:none;border:0;text-align:left;padding:.65em .8em;border-radius:8px;cursor:pointer;min-height:44px}
 .menu button:hover{background:var(--line)}
+.seg-row{padding:.5em .8em .7em;border-bottom:1px solid var(--line);margin-bottom:4px}
+.seg-lbl{font-weight:600}
+.seg{display:flex;gap:4px;margin-top:6px}
+.menu .seg button{flex:1;min-height:40px;border:1px solid var(--line);border-radius:8px;background:var(--bg);padding:.3em .35em;text-align:center;font-size:14px}
+.menu .seg button[aria-checked="true"]{background:var(--accent);border-color:var(--accent);color:var(--accent-fg);font-weight:600}
+.seg-help{font-size:13px;color:var(--muted);margin-top:6px;max-width:17em}
 .feedwrap{position:relative;flex:1;min-height:0}
 .feed{position:absolute;inset:0;overflow-y:auto;padding:14px max(16px,env(safe-area-inset-right)) 28px max(16px,env(safe-area-inset-left));font-size:var(--fs);-webkit-overflow-scrolling:touch}
 .turn{--h:0;margin:0 0 .4em;padding:.2em .6em .3em;border-left:max(5px,.2em) solid hsl(var(--h),75%,55%);background:hsla(var(--h),70%,50%,var(--tint));border-radius:0 .3em .3em 0}
@@ -123,7 +129,11 @@ h1{font-size:1.5em;margin:0 0 .3em}
       <button id="bMenu" class="btn" aria-label="More options" aria-expanded="false">⋯</button>
     </div>
     <div id="menu" class="menu" hidden>
-      <button id="bDedupe"></button>
+      <div class="seg-row">
+        <div class="seg-lbl">Filter other voices</div>
+        <div id="sens" class="seg" role="radiogroup" aria-label="Filter other voices"></div>
+        <div id="sensHelp" class="seg-help"></div>
+      </div>
       <button id="bRoom">Room mic (this device listens)</button>
       <button id="bSave">Save transcript</button>
       <button id="bClear">Clear transcript</button>
@@ -422,19 +432,34 @@ function startHost() {
   /* Same room, several phones: everyone's phone hears everyone. When two phones send nearly the
      same sentence within 10 seconds, keep one copy, credited to the phone that heard it best
      (higher speech-engine confidence; if that's unclear, the one that caught more words). */
-  H.dedupe = store.get('lc_dedupe', true);
+  /* how eager the filter is:
+     window  – how far apart (ms) two phones' copies can arrive and still count as one sentence
+     overlap – share of words they must have in common
+     minWords – shorter sentences are never merged ("yes" from two people is two answers)
+     floor   – Strict only: a sentence no other phone sent, heard with confidence below this, is
+               treated as far-away speech and hidden (0 = unknown confidence, never hidden) */
+  const SENS = {
+    off:    { label: 'Off',    help: 'Every phone’s text is shown, even when two phones heard the same thing.' },
+    gentle: { label: 'Gentle', window: 6000,  overlap: 0.75, minWords: 4, floor: 0,   help: 'Merges only near-identical repeats. Least likely to hide anything.' },
+    normal: { label: 'Normal', window: 10000, overlap: 0.6,  minWords: 3, floor: 0,   help: 'Merges sentences that two phones both heard, keeping the clearer one.' },
+    strict: { label: 'Strict', window: 15000, overlap: 0.45, minWords: 2, floor: 0.5, help: 'Merges more eagerly and also hides faint, far-away speech. May drop a quiet speaker.' }
+  };
+  H.sens = store.get('lc_sens', store.get('lc_dedupe', true) === false ? 'off' : 'normal');
+  if (!SENS[H.sens]) H.sens = 'normal';
   H.recent = [];
   const wordsOf = t => t.toLowerCase().replace(/[^\p{L}\p{N}' ]+/gu, ' ').split(/\s+/).filter(Boolean);
   function similar(a, b) {
-    if (Math.min(a.length, b.length) < 3) return false; // "yes" from two people is two answers
+    const S = SENS[H.sens];
+    if (Math.min(a.length, b.length) < S.minWords) return false;
     const count = new Map(); for (const w of a) count.set(w, (count.get(w) || 0) + 1);
     let common = 0; for (const w of b) { const n = count.get(w); if (n) { common++; count.set(w, n - 1); } }
-    return common / Math.min(a.length, b.length) >= 0.6;
+    return common / Math.min(a.length, b.length) >= S.overlap;
   }
   function findDup(c) {
     const now = Date.now();
-    H.recent = H.recent.filter(r => now - r.at < 10000 && r.span.isConnected);
-    for (let i = H.recent.length - 1; i >= 0; i--) { const r = H.recent[i]; if (r.k !== c.k && similar(r.words, c.words)) return r; }
+    H.recent = H.recent.filter(r => now - r.at < SENS.strict.window && r.span.isConnected);
+    const win = SENS[H.sens].window;
+    for (let i = H.recent.length - 1; i >= 0; i--) { const r = H.recent[i]; if (r.k !== c.k && now - r.at < win && similar(r.words, c.words)) return r; }
     return null;
   }
   function beats(c, r) {
@@ -471,8 +496,10 @@ function startHost() {
     if (final) {
       H.live.delete(key);
       const cand = { k, words: wordsOf(text), conf, at: Date.now() };
-      const dup = text && H.dedupe ? findDup(cand) : null;
-      if (!text || (dup && !beats(cand, dup))) {
+      const S = SENS[H.sens], on = H.sens !== 'off';
+      const dup = text && on ? findDup(cand) : null;
+      const faint = on && !dup && k !== 'room' && S.floor && conf > 0 && conf < S.floor;
+      if (!text || faint || (dup && !beats(cand, dup))) {
         removeSpan(L.turn, L.span); // empty, or someone else's phone already has this sentence, heard better
       } else {
         if (dup) dropCommitted(dup); // this phone heard it better: take it away from the other one
@@ -642,12 +669,19 @@ function startHost() {
   const menu = $('#menu'), bMenu = $('#bMenu');
   bMenu.onclick = e => { e.stopPropagation(); menu.hidden = !menu.hidden; bMenu.setAttribute('aria-expanded', String(!menu.hidden)); };
   document.addEventListener('click', e => { if (!menu.hidden && !menu.contains(e.target)) { menu.hidden = true; bMenu.setAttribute('aria-expanded', 'false'); } });
-  menu.addEventListener('click', e => { if (e.target.tagName === 'BUTTON') menu.hidden = true; });
+  menu.addEventListener('click', e => { if (e.target.tagName === 'BUTTON' && !e.target.closest('.seg')) menu.hidden = true; });
   $('#bTheme').onclick = toggleTheme;
-  const bDedupe = $('#bDedupe');
-  const renderDedupe = () => { bDedupe.textContent = H.dedupe ? 'Same room: show each sentence once ✓' : 'Same room: show each sentence once (off)'; };
-  bDedupe.onclick = () => { H.dedupe = !H.dedupe; store.set('lc_dedupe', H.dedupe); renderDedupe(); };
-  renderDedupe();
+  function renderSens() {
+    const box = $('#sens'); box.textContent = '';
+    for (const [id, s] of Object.entries(SENS)) {
+      const b = document.createElement('button'); b.type = 'button'; b.textContent = s.label;
+      b.setAttribute('role', 'radio'); b.setAttribute('aria-checked', String(id === H.sens));
+      b.onclick = () => { H.sens = id; store.set('lc_sens', id); renderSens(); };
+      box.append(b);
+    }
+    $('#sensHelp').textContent = SENS[H.sens].help;
+  }
+  renderSens();
   $('#bSave').onclick = () => {
     const lines = H.log.map(e => '[' + hhmm(e.ts) + '] ' + e.n + ': ' + e.t);
     const d = new Date(), p = x => String(x).padStart(2, '0');
